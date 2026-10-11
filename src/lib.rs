@@ -116,10 +116,65 @@ mod testes {
     }
 
     #[test]
-    fn tab_manager_ciclo_de_vida() {
-        let mut manager = crate::tab_manager::TabManager::new();
-        let _ = manager.discover_document_windows();
-        assert_eq!(manager.get_active_windows().len(), 0);
-        manager.cleanup();
+    fn suporte_completo_idispatch_e_idtextensibility2() {
+        let mut factory_ptr = std::ptr::null_mut();
+        let res = unsafe {
+            DllGetClassObject(
+                &crate::com_addin_simple::ADDIN_CLSID,
+                &IClassFactory::IID,
+                &mut factory_ptr,
+            )
+        };
+        assert_eq!(res, S_OK);
+        assert!(!factory_ptr.is_null());
+
+        let factory: IClassFactory = unsafe { IClassFactory::from_raw(factory_ptr) };
+
+        // 1. Criar instancia via IClassFactory retornando IUnknown
+        let unk: windows::core::IUnknown = unsafe { factory.CreateInstance(None).unwrap() };
+
+        // 2. Obter IDispatch via QueryInterface
+        let disp: Result<windows::Win32::System::Com::IDispatch, _> = unk.cast();
+        assert!(disp.is_ok());
+
+        // 3. Obter IDTExtensibility2 via QueryInterface
+        let mut extensibility_ptr = std::ptr::null_mut();
+        let hr2 = unsafe {
+            unk.query(
+                &crate::com_addin_simple::IID_IDTEXTENSIBILITY2,
+                &mut extensibility_ptr,
+            )
+            .ok()
+        };
+        assert!(hr2.is_ok());
+        assert!(!extensibility_ptr.is_null());
+
+        // Testar chamada do vtable de OnConnection diretamente pelo ABI C
+        unsafe {
+            type OnConnFn = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                i32,
+                *mut std::ffi::c_void,
+                *mut *mut std::ffi::c_void,
+            ) -> windows::core::HRESULT;
+            type ReleaseFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+
+            let vtbl = *(extensibility_ptr as *const *const usize);
+            // OnConnection fica no slot 7 (offset 7)
+            let on_connection: OnConnFn = std::mem::transmute(*vtbl.add(7));
+            let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+
+            let hr_conn = on_connection(
+                extensibility_ptr,
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(hr_conn, S_OK);
+
+            release(extensibility_ptr);
+        }
     }
 }

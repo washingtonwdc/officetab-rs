@@ -71,5 +71,30 @@ foreach ($App in $Aplicativos) {
     Write-Host "[OK] Suplemento registrado para Microsoft $App (LoadBehavior=3)" -ForegroundColor Green
 }
 
-Write-Host "`n[SUCESSO] Office Tab Pro (Rust) instalado com sucesso no perfil do usuario!" -ForegroundColor Green
-Write-Host "Ao abrir Word, Excel ou PowerPoint, o suplemento sera carregado automaticamente pelo Office." -ForegroundColor Yellow
+# 5. Limpar entradas em Itens Desabilitados (Resiliency) do Office
+foreach ($App in $Aplicativos) {
+    $ResiliencyPath = "HKCU:\Software\Microsoft\Office\16.0\$App\Resiliency\DisabledItems"
+    if (Test-Path $ResiliencyPath) {
+        $props = Get-ItemProperty $ResiliencyPath
+        $props.PSObject.Properties | Where-Object { $_.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider") } | ForEach-Object {
+            $val = $_.Value
+            if ($val -is [byte[]]) {
+                $str = [System.Text.Encoding]::Unicode.GetString($val)
+                if ($str -match "officetab" -or $str -match "OfficeTabs") {
+                    Remove-ItemProperty -Path $ResiliencyPath -Name $_.Name -Force
+                    Write-Host "[OK] Removido da lista de Itens Desabilitados do Microsoft $App (ID $($_.Name))" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+}
+
+# 6. Verificar se processos do Office estao abertos
+$processosAbertos = Get-Process winword, excel, powerpnt -ErrorAction SilentlyContinue
+if ($processosAbertos) {
+    Write-Host "`n[AVISO] Aplicativos do Office foram detectados em execucao ($($processosAbertos.ProcessName -join ', '))." -ForegroundColor Yellow
+    Write-Host "Feche e reabra o Word/Excel/PowerPoint para que o novo suplemento seja carregado." -ForegroundColor Yellow
+}
+
+Write-Host "`n[SUCESSO] Office Tab Pro (Rust) instalado e ativado com sucesso no perfil do usuario!" -ForegroundColor Green
+

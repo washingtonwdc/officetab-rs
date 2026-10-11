@@ -1,113 +1,255 @@
-//! Implementacao do servidor COM interno do suplemento.
+//! Implementacao binaria exata de IDTExtensibility2 e IClassFactory para o Microsoft Office.
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::core::{
-    Error, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Result, implement, interface,
-};
+use windows::core::{Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, implement};
 
-/// Identificador estável da classe COM do suplemento.
+/// GUIDs oficiais de classes e interfaces do Microsoft Office
 pub const ADDIN_CLSID: GUID = GUID::from_u128(0x1c8ba3cd_5248_4611_8a6e_8ccbaf89b651);
 pub const ADDIN_PROG_ID: &str = "OfficeTabs.Connect";
 
+pub const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
+pub const IID_IDTEXTENSIBILITY2: GUID = GUID::from_u128(0xb65ad801_abaf_11d0_bb8b_00a0c90f2744);
+
+const S_OK: HRESULT = HRESULT(0);
+const E_NOTIMPL: HRESULT = HRESULT(0x80004001u32 as i32);
 const E_NOINTERFACE: HRESULT = HRESULT(0x80004002u32 as i32);
+const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 const CLASS_E_NOAGGREGATION: HRESULT = HRESULT(0x80040110u32 as i32);
+const DISP_E_UNKNOWNNAME: HRESULT = HRESULT(0x80020006u32 as i32);
+const DISP_E_MEMBERNOTFOUND: HRESULT = HRESULT(0x80020003u32 as i32);
 
 static OBJETOS_ATIVOS: AtomicU32 = AtomicU32::new(0);
 static BLOQUEIOS_SERVIDOR: AtomicU32 = AtomicU32::new(0);
 
-/// Interface publicada pelo Microsoft Office para suplementos COM.
-#[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
-unsafe trait IDTExtensibility2: IUnknown {
-    unsafe fn OnConnection(
-        &self,
-        application: Option<&IUnknown>,
-        modo_conexao: i32,
-        instancia_suplemento: Option<&IUnknown>,
-        personalizado: *const *const c_void,
-    ) -> HRESULT;
-    fn OnDisconnection(&self, modo_desconexao: i32, personalizado: *const *const c_void)
-    -> HRESULT;
-    fn OnAddInsUpdate(&self, personalizado: *const *const c_void) -> HRESULT;
-    fn OnStartupComplete(&self, personalizado: *const *const c_void) -> HRESULT;
-    fn OnBeginShutdown(&self, personalizado: *const *const c_void) -> HRESULT;
+/// Tabela de funções (Vtable) binária do IDTExtensibility2 (herdeira de IDispatch).
+/// A ordem e tipos dos 12 métodos correspondem rigorosamente ao ABI COM do Office.
+#[repr(C)]
+pub struct IDTExtensibility2_Vtbl {
+    // IUnknown (slots 0..2)
+    pub QueryInterface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub Release: unsafe extern "system" fn(*mut c_void) -> u32,
+
+    // IDispatch (slots 3..6)
+    pub GetTypeInfoCount: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+    pub GetTypeInfo: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+    pub GetIDsOfNames: unsafe extern "system" fn(
+        *mut c_void,
+        *const GUID,
+        *const PCWSTR,
+        u32,
+        u32,
+        *mut i32,
+    ) -> HRESULT,
+    pub Invoke: unsafe extern "system" fn(
+        *mut c_void,
+        i32,
+        *const GUID,
+        u32,
+        u16,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut u32,
+    ) -> HRESULT,
+
+    // IDTExtensibility2 (slots 7..11)
+    pub OnConnection: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void, // Application (IDispatch*)
+        i32,         // ConnectMode
+        *mut c_void, // AddInInst (IDispatch*)
+        *mut *mut c_void,
+    ) -> HRESULT,
+    pub OnDisconnection: unsafe extern "system" fn(
+        *mut c_void,
+        i32, // RemoveMode
+        *mut *mut c_void,
+    ) -> HRESULT,
+    pub OnAddInsUpdate: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub OnStartupComplete: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub OnBeginShutdown: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
 }
 
-#[implement(IDTExtensibility2)]
-struct ObjetoSuplemento {
-    instancia: std::sync::Mutex<Option<crate::implementation::OfficeTab>>,
+#[repr(C)]
+struct AddinInstance {
+    lp_vtbl: *const IDTExtensibility2_Vtbl,
+    ref_count: AtomicU32,
+    instancia: Mutex<Option<crate::implementation::OfficeTab>>,
 }
 
-impl ObjetoSuplemento {
-    fn novo() -> Self {
-        OBJETOS_ATIVOS.fetch_add(1, Ordering::AcqRel);
-        Self {
-            instancia: std::sync::Mutex::new(None),
+// Implementações C-ABI para a Vtable
+unsafe extern "system" fn addin_query_interface(
+    this: *mut c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() || riid.is_null() {
+        return E_POINTER;
+    }
+    unsafe { *ppv = std::ptr::null_mut() };
+
+    let iid = unsafe { &*riid };
+    if *iid == IUnknown::IID || *iid == IID_IDISPATCH || *iid == IID_IDTEXTENSIBILITY2 {
+        unsafe {
+            addin_add_ref(this);
+            *ppv = this;
         }
+        S_OK
+    } else {
+        E_NOINTERFACE
     }
 }
 
-impl Drop for ObjetoSuplemento {
-    fn drop(&mut self) {
+unsafe extern "system" fn addin_add_ref(this: *mut c_void) -> u32 {
+    let instance = unsafe { &*(this as *const AddinInstance) };
+    instance.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn addin_release(this: *mut c_void) -> u32 {
+    let instance_ptr = this as *mut AddinInstance;
+    let old_count = unsafe { (*instance_ptr).ref_count.fetch_sub(1, Ordering::Release) };
+    if old_count == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
         OBJETOS_ATIVOS.fetch_sub(1, Ordering::AcqRel);
+        drop(unsafe { Box::from_raw(instance_ptr) });
+        0
+    } else {
+        old_count - 1
     }
 }
 
-impl IDTExtensibility2_Impl for ObjetoSuplemento_Impl {
-    unsafe fn OnConnection(
-        &self,
-        _application: Option<&IUnknown>,
-        _modo_conexao: i32,
-        _instancia_suplemento: Option<&IUnknown>,
-        _personalizado: *const *const c_void,
-    ) -> HRESULT {
-        let app = crate::implementation::OfficeTab::new();
-        let _ = app.initialize();
-        if let Ok(mut lock) = self.instancia.lock() {
-            *lock = Some(app);
-        }
-        HRESULT(0)
+unsafe extern "system" fn addin_get_type_info_count(
+    _this: *mut c_void,
+    pctinfo: *mut u32,
+) -> HRESULT {
+    if !pctinfo.is_null() {
+        unsafe { *pctinfo = 0 };
     }
-
-    unsafe fn OnDisconnection(
-        &self,
-        _modo_desconexao: i32,
-        _personalizado: *const *const c_void,
-    ) -> HRESULT {
-        if let Ok(mut lock) = self.instancia.lock()
-            && let Some(app) = lock.take()
-        {
-            app.shutdown();
-        }
-        HRESULT(0)
-    }
-
-    unsafe fn OnAddInsUpdate(&self, _personalizado: *const *const c_void) -> HRESULT {
-        HRESULT(0)
-    }
-
-    unsafe fn OnStartupComplete(&self, _personalizado: *const *const c_void) -> HRESULT {
-        if let Ok(lock) = self.instancia.lock()
-            && let Some(ref app) = *lock
-        {
-            let _ = app.attach_to_active_office();
-        }
-        HRESULT(0)
-    }
-
-    unsafe fn OnBeginShutdown(&self, _personalizado: *const *const c_void) -> HRESULT {
-        if let Ok(mut lock) = self.instancia.lock()
-            && let Some(app) = lock.take()
-        {
-            app.shutdown();
-        }
-        HRESULT(0)
-    }
+    S_OK
 }
+
+unsafe extern "system" fn addin_get_type_info(
+    _this: *mut c_void,
+    _itinfo: u32,
+    _lcid: u32,
+    pptinfo: *mut *mut c_void,
+) -> HRESULT {
+    if !pptinfo.is_null() {
+        unsafe { *pptinfo = std::ptr::null_mut() };
+    }
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn addin_get_ids_of_names(
+    _this: *mut c_void,
+    _riid: *const GUID,
+    _rgsznames: *const PCWSTR,
+    _cnames: u32,
+    _lcid: u32,
+    _rgdispid: *mut i32,
+) -> HRESULT {
+    DISP_E_UNKNOWNNAME
+}
+
+unsafe extern "system" fn addin_invoke(
+    _this: *mut c_void,
+    _dispidmember: i32,
+    _riid: *const GUID,
+    _lcid: u32,
+    _wflags: u16,
+    _pdispparams: *const c_void,
+    _pvarresult: *mut c_void,
+    _pexcepinfo: *mut c_void,
+    _puargerr: *mut u32,
+) -> HRESULT {
+    DISP_E_MEMBERNOTFOUND
+}
+
+unsafe extern "system" fn addin_on_connection(
+    this: *mut c_void,
+    _application: *mut c_void,
+    _connect_mode: i32,
+    _add_in_inst: *mut c_void,
+    _custom: *mut *mut c_void,
+) -> HRESULT {
+    let instance = unsafe { &*(this as *const AddinInstance) };
+    let app = crate::implementation::OfficeTab::new();
+    let _ = app.initialize();
+    if let Ok(mut lock) = instance.instancia.lock() {
+        *lock = Some(app);
+    }
+    S_OK
+}
+
+unsafe extern "system" fn addin_on_disconnection(
+    this: *mut c_void,
+    _remove_mode: i32,
+    _custom: *mut *mut c_void,
+) -> HRESULT {
+    let instance = unsafe { &*(this as *const AddinInstance) };
+    if let Ok(mut lock) = instance.instancia.lock()
+        && let Some(app) = lock.take()
+    {
+        app.shutdown();
+    }
+    S_OK
+}
+
+unsafe extern "system" fn addin_on_add_ins_update(
+    _this: *mut c_void,
+    _custom: *mut *mut c_void,
+) -> HRESULT {
+    S_OK
+}
+
+unsafe extern "system" fn addin_on_startup_complete(
+    this: *mut c_void,
+    _custom: *mut *mut c_void,
+) -> HRESULT {
+    let instance = unsafe { &*(this as *const AddinInstance) };
+    if let Ok(lock) = instance.instancia.lock()
+        && let Some(ref app) = *lock
+    {
+        let _ = app.attach_to_active_office();
+    }
+    S_OK
+}
+
+unsafe extern "system" fn addin_on_begin_shutdown(
+    this: *mut c_void,
+    _custom: *mut *mut c_void,
+) -> HRESULT {
+    let instance = unsafe { &*(this as *const AddinInstance) };
+    if let Ok(mut lock) = instance.instancia.lock()
+        && let Some(app) = lock.take()
+    {
+        app.shutdown();
+    }
+    S_OK
+}
+
+static ADDIN_VTBL: IDTExtensibility2_Vtbl = IDTExtensibility2_Vtbl {
+    QueryInterface: addin_query_interface,
+    AddRef: addin_add_ref,
+    Release: addin_release,
+    GetTypeInfoCount: addin_get_type_info_count,
+    GetTypeInfo: addin_get_type_info,
+    GetIDsOfNames: addin_get_ids_of_names,
+    Invoke: addin_invoke,
+    OnConnection: addin_on_connection,
+    OnDisconnection: addin_on_disconnection,
+    OnAddInsUpdate: addin_on_add_ins_update,
+    OnStartupComplete: addin_on_startup_complete,
+    OnBeginShutdown: addin_on_begin_shutdown,
+};
 
 #[implement(IClassFactory)]
 struct FabricaSuplemento;
@@ -129,8 +271,22 @@ impl IClassFactory_Impl for FabricaSuplemento_Impl {
             return Err(Error::from(CLASS_E_NOAGGREGATION));
         }
 
-        let objeto: IDTExtensibility2 = ObjetoSuplemento::novo().into();
-        consultar_interface(&objeto, riid, ppv)
+        OBJETOS_ATIVOS.fetch_add(1, Ordering::AcqRel);
+        let instance = Box::new(AddinInstance {
+            lp_vtbl: &ADDIN_VTBL,
+            ref_count: AtomicU32::new(1),
+            instancia: Mutex::new(None),
+        });
+
+        let raw = Box::into_raw(instance) as *mut c_void;
+        let hr = unsafe { addin_query_interface(raw, riid, ppv) };
+        unsafe { addin_release(raw) };
+
+        if hr.0 == 0 {
+            Ok(())
+        } else {
+            Err(Error::from(hr))
+        }
     }
 
     fn LockServer(&self, bloquear: BOOL) -> Result<()> {
