@@ -93,17 +93,36 @@ unsafe extern "system" fn procedimento_subclass(
     _ref_data: usize,
 ) -> LRESULT {
     const WM_DESTROY: u32 = 0x0002;
+    const WM_SIZE: u32 = 0x0005;
+    const WM_NOTIFY: u32 = 0x004E;
     const WM_NCDESTROY: u32 = 0x0082;
+    const WM_TIMER: u32 = 0x0113;
 
-    if msg == WM_NCDESTROY || msg == WM_DESTROY {
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(procedimento_subclass), uid_subclass);
+    match msg {
+        WM_TIMER if wparam.0 == crate::tab_manager::OFFICETAB_TIMER_ID => {
+            crate::tab_manager::despachar_timer(hwnd);
+            return LRESULT(0);
         }
-        if let Ok(mut guard) = JANELAS_SUBCLASSED.lock()
-            && let Some(ref mut set) = *guard
-        {
-            set.remove(&(hwnd.0 as isize));
+        WM_SIZE => {
+            let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            crate::tab_manager::despachar_size(hwnd);
+            return res;
         }
+        WM_NOTIFY => {
+            crate::tab_manager::despachar_notify(hwnd, lparam);
+        }
+        WM_NCDESTROY | WM_DESTROY => {
+            crate::tab_manager::despachar_destroy(hwnd);
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(procedimento_subclass), uid_subclass);
+            }
+            if let Ok(mut guard) = JANELAS_SUBCLASSED.lock()
+                && let Some(ref mut set) = *guard
+            {
+                set.remove(&(hwnd.0 as isize));
+            }
+        }
+        _ => {}
     }
 
     // Encaminha a mensagem para o próximo procedimento na cadeia (preservando o comportamento nativo do Office)

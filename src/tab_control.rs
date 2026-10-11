@@ -1,15 +1,17 @@
-//! Wrapper para o controle nativo SysTabControl32 do Windows.
-
+use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    TCIF_TEXT, TCITEMW, TCM_DELETEITEM, TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_INSERTITEMW,
-    TCM_SETCURSEL, TCS_FIXEDWIDTH, TCS_TABS,
+    InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, TCIF_TEXT, TCITEMW,
+    TCM_DELETEALLITEMS, TCM_DELETEITEM, TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_INSERTITEMW,
+    TCM_SETCURSEL, TCS_FOCUSNEVER, TCS_TABS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, HMENU, MoveWindow, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, MoveWindow, SendMessageW, SetWindowPos, ShowWindow, HMENU,
+    HWND_TOP, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_VISIBLE,
 };
-use windows::core::{PCWSTR, Result, w};
 
 /// Estrutura que encapsula um controle de abas nativo do Windows.
 pub struct TabControl {
@@ -17,26 +19,52 @@ pub struct TabControl {
 }
 
 impl TabControl {
-    /// Cria um novo controle de abas como filho da janela especificada.
-    pub fn new(parent_hwnd: HWND, id: u32) -> Result<Self> {
-        let estilo =
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | TCS_TABS | TCS_FIXEDWIDTH);
-
+    /// Cria um novo controle de abas como filho da janela especificada com posição e tamanho definidos.
+    pub fn new(
+        parent_hwnd: HWND,
+        id: u32,
+        x: i32,
+        y: i32,
+        largura: i32,
+        altura: i32,
+    ) -> Result<Self> {
         unsafe {
+            let icex = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_TAB_CLASSES,
+            };
+            let _ = InitCommonControlsEx(&icex);
+
+            let estilo = WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | TCS_TABS | TCS_FOCUSNEVER,
+            );
+
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("SysTabControl32"),
                 PCWSTR::null(),
                 estilo,
-                0,
-                0,
-                0,
-                28,
+                x,
+                y,
+                largura,
+                altura,
                 parent_hwnd,
                 HMENU(id as usize as *mut _),
-                None,
+                hinstance,
                 None,
             )?;
+
+            // Aplicar fonte nítida padrão da interface do Windows
+            let hfont = GetStockObject(DEFAULT_GUI_FONT);
+            if !hfont.is_invalid() {
+                let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
+            }
+
+            // Assegurar visibilidade no topo de Z-Order e repintura
+            let _ = SetWindowPos(hwnd, HWND_TOP, x, y, largura, altura, SWP_SHOWWINDOW);
+            let _ = ShowWindow(hwnd, SW_SHOW);
 
             Ok(Self { hwnd })
         }
@@ -82,6 +110,13 @@ impl TabControl {
         }
     }
 
+    /// Remove todas as abas existentes do controle.
+    pub fn clear_tabs(&self) {
+        unsafe {
+            let _ = SendMessageW(self.hwnd, TCM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+        }
+    }
+
     /// Retorna o índice da aba atualmente selecionada.
     pub fn get_selected_tab(&self) -> i32 {
         unsafe {
@@ -115,15 +150,8 @@ impl TabControl {
     pub fn resize(&self, x: i32, y: i32, largura: i32, altura: i32) -> Result<()> {
         unsafe {
             MoveWindow(self.hwnd, x, y, largura, altura, true)?;
-            SetWindowPos(
-                self.hwnd,
-                HWND::default(),
-                x,
-                y,
-                largura,
-                altura,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            )?;
+            SetWindowPos(self.hwnd, HWND_TOP, x, y, largura, altura, SWP_SHOWWINDOW)?;
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
             Ok(())
         }
     }
@@ -144,3 +172,6 @@ impl Drop for TabControl {
         self.destroy();
     }
 }
+
+unsafe impl Send for TabControl {}
+unsafe impl Sync for TabControl {}
