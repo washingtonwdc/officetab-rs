@@ -183,13 +183,17 @@ unsafe extern "system" fn addin_on_connection(
     crate::tab_manager::log_debug(&format!("addin_on_connection: mode={}", _connect_mode));
     let instance = unsafe { &*(this as *const AddinInstance) };
     let app = crate::implementation::OfficeTab::new();
+    // initialize() inicia a thread de monitoramento REA — ela fará o PostMessage
+    // para a thread de UI, que criará os TabControls com segurança de thread.
+    // NÃO chamamos attach_to_active_office aqui pois estaria na thread COM,
+    // não na thread de UI do Word.
     let _ = app.initialize();
-    let _ = app.attach_to_active_office();
     if let Ok(mut lock) = instance.instancia.lock() {
         *lock = Some(app);
     }
     S_OK
 }
+
 
 unsafe extern "system" fn addin_on_disconnection(
     this: *mut c_void,
@@ -213,16 +217,13 @@ unsafe extern "system" fn addin_on_add_ins_update(
 }
 
 unsafe extern "system" fn addin_on_startup_complete(
-    this: *mut c_void,
+    _this: *mut c_void,
     _custom: *mut *mut c_void,
 ) -> HRESULT {
-    crate::tab_manager::log_debug("addin_on_startup_complete");
-    let instance = unsafe { &*(this as *const AddinInstance) };
-    if let Ok(lock) = instance.instancia.lock()
-        && let Some(ref app) = *lock
-    {
-        let _ = app.attach_to_active_office();
-    }
+    // OnStartupComplete é chamado na thread COM, não na thread de UI do Word.
+    // A thread de monitoramento REA já iniciou em OnConnection e fará
+    // os PostMessages para a thread de UI automaticamente.
+    crate::tab_manager::log_debug("addin_on_startup_complete: OK (monitoramento REA ativo)");
     S_OK
 }
 

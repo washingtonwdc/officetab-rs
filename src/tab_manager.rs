@@ -368,7 +368,7 @@ static MONITORAMENTO_ATIVO: AtomicBool = AtomicBool::new(false);
 
 /// Inicia uma thread de background para APENAS detectar novas janelas do Office.
 /// A thread NUNCA cria ou move janelas Win32 — apenas posta WM_OFFICETAB_INICIALIZAR
-/// para que a thread de UI do Office faça a inicialização segura.
+/// UMA ÚNICA VEZ por HWND usando um HashSet local, eliminando o flood de mensagens.
 pub fn iniciar_thread_monitoramento() {
     if MONITORAMENTO_ATIVO.swap(true, Ordering::SeqCst) {
         return; // Já está rodando
@@ -377,38 +377,42 @@ pub fn iniciar_thread_monitoramento() {
     std::thread::spawn(|| {
         log_debug("Thread de monitoramento REA iniciada");
 
+        // HashSet LOCAL à thread — rastreia HWNDs que já receberam PostMessage.
+        // Não depende do Mutex global, portanto nunca bloqueia e nunca re-posta.
+        let mut ja_postados: std::collections::HashSet<isize> = std::collections::HashSet::new();
+
         while MONITORAMENTO_ATIVO.load(Ordering::Relaxed) {
-            // Detectar janelas do Office no processo atual
             let janelas = listar_janelas_processo();
+            let hwnds_atuais: std::collections::HashSet<isize> =
+                janelas.iter().map(|(h, _)| h.0 as isize).collect();
 
-            for (hwnd, _titulo) in janelas {
-                // Verificar se esta janela já está sendo monitorada
-                let ja_monitorada = GLOBAL_TAB_MANAGER
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|m| m.esta_monitorado(hwnd)))
-                    .unwrap_or(false);
+            // Remover HWNDs que não existem mais (janela fechada) para permitir reinicialização
+            ja_postados.retain(|raw| hwnds_atuais.contains(raw));
 
-                if !ja_monitorada {
-                    // REA: Postar mensagem para a thread de UI do OpusApp
-                    // PostMessageW NÃO bloqueia — retorna imediatamente
-                    // A thread de UI recebe a mensagem e faz o subclassing + criação
+            for (hwnd, _titulo) in &janelas {
+                let raw = hwnd.0 as isize;
+
+                // Postar APENAS se ainda não foi postado para este HWND nesta sessão
+                if !ja_postados.contains(&raw) {
                     unsafe {
-                        let _ = PostMessageW(
-                            hwnd,
+                        let ok = PostMessageW(
+                            *hwnd,
                             WM_OFFICETAB_INICIALIZAR,
                             windows::Win32::Foundation::WPARAM(0),
                             windows::Win32::Foundation::LPARAM(0),
                         );
+                        if ok.is_ok() {
+                            ja_postados.insert(raw);
+                            log_debug(&format!(
+                                "REA: PostMessage INICIALIZAR → HWND=0x{:X}",
+                                hwnd.0 as usize
+                            ));
+                        }
                     }
-                    log_debug(&format!(
-                        "REA: PostMessage WM_OFFICETAB_INICIALIZAR → HWND=0x{:X}",
-                        hwnd.0 as usize
-                    ));
                 }
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(600));
+            std::thread::sleep(std::time::Duration::from_millis(800));
         }
 
         log_debug("Thread de monitoramento REA encerrada");
