@@ -33,9 +33,16 @@ if (-not (Test-Path $DllPath)) {
 $FullPath = (Resolve-Path $DllPath).Path
 Write-Host "[OK] DLL localizada: $FullPath" -ForegroundColor Green
 
-$ProgId = "OfficeTabs.Connect"
-$Clsid = "{1c8ba3cd-5248-4611-8a6e-8ccbaf89b651}"
-$Descricao = "Office Tab Pro (Rust Reimplementation)"
+# Limpar chaves legadas com conflito se existirem no escopo do usuario
+Remove-Item -Path "HKCU:\Software\Classes\OfficeTabs.Connect" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "HKCU:\Software\Classes\CLSID\{1c8ba3cd-5248-4611-8a6e-8ccbaf89b651}" -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($OldApp in @("Word", "Excel", "PowerPoint")) {
+    Remove-Item -Path "HKCU:\Software\Microsoft\Office\$OldApp\Addins\OfficeTabs.Connect" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$ProgId = "OfficeTabRs.Connect"
+$Clsid = "{9a1929ef-1495-413e-993c-326dd15e35df}"
+$Descricao = "Office Tab Rust"
 $Aplicativos = @("Word", "Excel", "PowerPoint")
 
 # 2. Registrar ProgID em HKCU:\Software\Classes

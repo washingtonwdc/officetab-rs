@@ -9,8 +9,8 @@ use windows::Win32::System::Registry::{
 use windows::core::{PCWSTR, Result};
 
 const ADDIN_PROG_ID: &str = crate::com_addin_simple::ADDIN_PROG_ID;
-const ADDIN_CLSID_STR: &str = "{1c8ba3cd-5248-4611-8a6e-8ccbaf89b651}";
-const ADDIN_DESC: &str = "Office Tab Pro (Rust Reimplementation)";
+const ADDIN_CLSID_STR: &str = "{9a1929ef-1495-413e-993c-326dd15e35df}";
+const ADDIN_DESC: &str = "Office Tab Rust";
 const LOAD_BEHAVIOR: u32 = 3; // 3 = Carregar na inicialização do Office
 
 const OFFICE_APPS: &[&str] = &["Word", "Excel", "PowerPoint"];

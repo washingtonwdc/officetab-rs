@@ -10,8 +10,8 @@ use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::core::{Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, implement};
 
 /// GUIDs oficiais de classes e interfaces do Microsoft Office
-pub const ADDIN_CLSID: GUID = GUID::from_u128(0x1c8ba3cd_5248_4611_8a6e_8ccbaf89b651);
-pub const ADDIN_PROG_ID: &str = "OfficeTabs.Connect";
+pub const ADDIN_CLSID: GUID = GUID::from_u128(0x9a1929ef_1495_413e_993c_326dd15e35df);
+pub const ADDIN_PROG_ID: &str = "OfficeTabRs.Connect";
 
 pub const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
 pub const IID_IDTEXTENSIBILITY2: GUID = GUID::from_u128(0xb65ad801_abaf_11d0_bb8b_00a0c90f2744);
