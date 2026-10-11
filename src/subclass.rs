@@ -83,7 +83,8 @@ impl Default for SubclassManager {
     }
 }
 
-/// Procedimento de janela subclassed. Repassa mensagens mantendo a integridade do Office.
+/// Procedimento de janela subclassed.
+/// Todas as mensagens Win32 chegam aqui NA THREAD DE UI DO OFFICE — seguro para Win32.
 unsafe extern "system" fn procedimento_subclass(
     hwnd: HWND,
     msg: u32,
@@ -98,19 +99,44 @@ unsafe extern "system" fn procedimento_subclass(
     const WM_NCDESTROY: u32 = 0x0082;
     const WM_TIMER: u32 = 0x0113;
 
+    // Mensagens REA — postadas pela thread de background e recebidas aqui na thread de UI
+    let wm_inicializar = crate::tab_manager::WM_OFFICETAB_INICIALIZAR;
+    let wm_recarregar = crate::tab_manager::WM_OFFICETAB_RECARREGAR;
+
     match msg {
+        // WM_TIMER: atualização periódica (disparado na thread de UI)
         WM_TIMER if wparam.0 == crate::tab_manager::OFFICETAB_TIMER_ID => {
             crate::tab_manager::despachar_timer(hwnd);
             return LRESULT(0);
         }
+
+        // WM_SIZE: redimensionamento da janela do Office (thread de UI)
         WM_SIZE => {
             let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
             crate::tab_manager::despachar_size(hwnd);
             return res;
         }
+
+        // WM_NOTIFY: notificações do TabControl (clique em aba, etc.)
         WM_NOTIFY => {
             crate::tab_manager::despachar_notify(hwnd, lparam);
         }
+
+        // WM_OFFICETAB_INICIALIZAR: REA — postado pela thread de background
+        // quando detecta nova janela do Office. Executa subclassing e criação
+        // do TabControl com segurança pois estamos na thread de UI.
+        m if m == wm_inicializar => {
+            crate::tab_manager::despachar_inicializar(hwnd);
+            return LRESULT(0);
+        }
+
+        // WM_OFFICETAB_RECARREGAR: REA — força recarga de abas
+        m if m == wm_recarregar => {
+            crate::tab_manager::despachar_recarregar(hwnd);
+            return LRESULT(0);
+        }
+
+        // WM_DESTROY / WM_NCDESTROY: limpeza ao fechar a janela
         WM_NCDESTROY | WM_DESTROY => {
             crate::tab_manager::despachar_destroy(hwnd);
             unsafe {
@@ -122,9 +148,10 @@ unsafe extern "system" fn procedimento_subclass(
                 set.remove(&(hwnd.0 as isize));
             }
         }
+
         _ => {}
     }
 
-    // Encaminha a mensagem para o próximo procedimento na cadeia (preservando o comportamento nativo do Office)
+    // Encaminha para o próximo procedimento na cadeia (preservando o comportamento nativo do Office)
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }

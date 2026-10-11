@@ -1,25 +1,57 @@
 use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Graphics::Gdi::{
+    GetStockObject, InvalidateRect, UpdateWindow, DEFAULT_GUI_FONT,
+};
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    GetModuleHandleExW, GetModuleHandleW,
+};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, TCIF_TEXT, TCITEMW,
     TCM_DELETEALLITEMS, TCM_DELETEITEM, TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_INSERTITEMW,
     TCM_SETCURSEL, TCS_FOCUSNEVER, TCS_TABS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, MoveWindow, SendMessageW, SetWindowPos, ShowWindow, HMENU,
-    HWND_TOP, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD,
-    WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, MoveWindow, SendMessageW, SetWindowPos,
+    ShowWindow, HMENU, HWND_TOP, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
+
 
 /// Estrutura que encapsula um controle de abas nativo do Windows.
 pub struct TabControl {
     pub hwnd: HWND,
 }
 
+/// Obtém o HINSTANCE do módulo que contém a função `obter_hinstance_dll`.
+/// Isso garante que o TabControl seja criado com o HINSTANCE correto da nossa DLL
+/// e não do processo do Word, evitando problemas de reclassificação de janelas.
+fn obter_hinstance_dll() -> windows::Win32::Foundation::HMODULE {
+    unsafe {
+        let mut hmod = windows::Win32::Foundation::HMODULE::default();
+        // Passa o endereço desta própria função para localizar nossa DLL na memória
+        let addr = obter_hinstance_dll as *const std::ffi::c_void;
+        let ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            windows::core::PCWSTR(addr as *const u16),
+            &mut hmod,
+        );
+        if ok.is_ok() && !hmod.is_invalid() {
+            hmod
+        } else {
+            // Fallback: tenta pegar o handle pelo nome do módulo
+            GetModuleHandleW(None).unwrap_or_default()
+        }
+    }
+}
+
+
 impl TabControl {
     /// Cria um novo controle de abas como filho da janela especificada com posição e tamanho definidos.
+    /// DEVE ser chamado da thread de UI que possui a janela pai (parent_hwnd).
     pub fn new(
         parent_hwnd: HWND,
         id: u32,
@@ -29,6 +61,7 @@ impl TabControl {
         altura: i32,
     ) -> Result<Self> {
         unsafe {
+            // Inicializa os controles comuns (necessário para SysTabControl32)
             let icex = INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
                 dwICC: ICC_TAB_CLASSES,
@@ -39,7 +72,13 @@ impl TabControl {
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | TCS_TABS | TCS_FOCUSNEVER,
             );
 
-            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            // CRÍTICO: usar o HINSTANCE da nossa DLL, não do processo do Word
+            let hinstance = obter_hinstance_dll();
+
+            crate::tab_manager::log_debug(&format!(
+                "TabControl::new — pai=0x{:X} x={} y={} w={} h={} hmod=0x{:X}",
+                parent_hwnd.0 as usize, x, y, largura, altura, hinstance.0 as usize
+            ));
 
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -56,15 +95,30 @@ impl TabControl {
                 None,
             )?;
 
+            crate::tab_manager::log_debug(&format!(
+                "TabControl::new — HWND criado: 0x{:X}",
+                hwnd.0 as usize
+            ));
+
             // Aplicar fonte nítida padrão da interface do Windows
             let hfont = GetStockObject(DEFAULT_GUI_FONT);
             if !hfont.is_invalid() {
                 let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
             }
 
-            // Assegurar visibilidade no topo de Z-Order e repintura
-            let _ = SetWindowPos(hwnd, HWND_TOP, x, y, largura, altura, SWP_SHOWWINDOW);
+            // Posicionar no topo da Z-Order, forçar visibilidade e repintura
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                x,
+                y,
+                largura,
+                altura,
+                SWP_SHOWWINDOW | SWP_NOZORDER,
+            );
             let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
 
             Ok(Self { hwnd })
         }
@@ -150,8 +204,17 @@ impl TabControl {
     pub fn resize(&self, x: i32, y: i32, largura: i32, altura: i32) -> Result<()> {
         unsafe {
             MoveWindow(self.hwnd, x, y, largura, altura, true)?;
-            SetWindowPos(self.hwnd, HWND_TOP, x, y, largura, altura, SWP_SHOWWINDOW)?;
+            SetWindowPos(
+                self.hwnd,
+                HWND_TOP,
+                x,
+                y,
+                largura,
+                altura,
+                SWP_SHOWWINDOW | SWP_NOZORDER,
+            )?;
             let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = InvalidateRect(self.hwnd, None, false);
             Ok(())
         }
     }

@@ -1,4 +1,6 @@
-//! Gerenciador central de abas do Office (inspirado no TOTWindowsManager).
+//! Gerenciador central de abas do Office (baseado no TOTWindowsManager).
+//! Arquitetura REA: detecção na thread de background, criação/renderização
+//! exclusivamente na thread de UI do Word via PostMessage.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -17,11 +19,28 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetClassNameW, GetClientRect, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, MoveWindow,
-    SetForegroundWindow, SetTimer, ShowWindow, SW_RESTORE,
+    PostMessageW, SetForegroundWindow, SetTimer, ShowWindow, SW_RESTORE,
 };
 
 use crate::subclass::SubclassManager;
 use crate::tab_control::TabControl;
+
+// ---------------------------------------------------------------------------
+// Mensagem customizada REA: PostMessage → thread UI → criação segura de janelas
+// ---------------------------------------------------------------------------
+
+/// Mensagem REA: a thread de background posta esta mensagem para o OpusApp
+/// quando detecta que a janela ainda não foi subclassed/sincronizada.
+/// A thread de UI do Word recebe e executa a criação do TabControl.
+pub const WM_OFFICETAB_INICIALIZAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x01;
+
+/// Mensagem REA: recarga forçada dos títulos/abas (posta pela thread de background
+/// quando detecta mudança de documentos abertos).
+pub const WM_OFFICETAB_RECARREGAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x02;
+
+// ---------------------------------------------------------------------------
+// Constantes
+// ---------------------------------------------------------------------------
 
 pub fn log_debug(msg: &str) {
     use std::io::Write;
@@ -37,6 +56,10 @@ pub fn log_debug(msg: &str) {
 pub const OFFICETAB_CONTROL_ID: u32 = 5001;
 pub const OFFICETAB_TIMER_ID: usize = 0x544142; // 'TAB'
 pub const ALTURA_BARRA_ABAS: i32 = 28;
+
+// ---------------------------------------------------------------------------
+// Estruturas de dados
+// ---------------------------------------------------------------------------
 
 /// Metadados de uma janela de documento do Office
 #[derive(Debug, Clone)]
@@ -59,7 +82,13 @@ pub struct EstadoJanela {
 unsafe impl Send for EstadoJanela {}
 unsafe impl Sync for EstadoJanela {}
 
-/// Gerenciador central de abas e janelas do Office
+// ---------------------------------------------------------------------------
+// TabManager — opera SOMENTE na thread de UI
+// ---------------------------------------------------------------------------
+
+/// Gerenciador central de abas e janelas do Office.
+/// IMPORTANTE: todos os métodos que criam/movem janelas Win32 devem ser
+/// chamados exclusivamente da thread de UI do OpusApp (via WM_TIMER, WM_APP, WM_SIZE, WM_NOTIFY).
 pub struct TabManager {
     subclass_manager: SubclassManager,
     estados: HashMap<isize, EstadoJanela>,
@@ -82,13 +111,14 @@ impl TabManager {
     }
 
     /// Aplica o subclassing a uma janela do Office e a registra.
+    /// DEVE ser chamado da thread de UI do Office.
     pub fn monitor_window(&mut self, hwnd: HWND) -> Result<()> {
         let raw_hwnd = hwnd.0 as isize;
         if self.estados.contains_key(&raw_hwnd) {
             return Ok(());
         }
 
-        log_debug(&format!("monitor_window: HWND=0x{:X}", hwnd.0 as usize));
+        log_debug(&format!("monitor_window (thread UI): HWND=0x{:X}", hwnd.0 as usize));
         self.subclass_manager.subclass_window(hwnd)?;
 
         self.estados.insert(
@@ -103,19 +133,21 @@ impl TabManager {
             },
         );
 
-        // Ativar timer periódico de atualização (a cada 300ms)
+        // Ativar timer periódico de atualização (a cada 500ms — seguro pois
+        // WM_TIMER é sempre entregue na thread de UI que criou a janela)
         unsafe {
-            let _ = SetTimer(hwnd, OFFICETAB_TIMER_ID, 300, None);
+            let _ = SetTimer(hwnd, OFFICETAB_TIMER_ID, 500, None);
         }
 
-        // Executar sincronização inicial imediata
+        // Executar sincronização inicial imediata (estamos na thread de UI)
         let res = self.sincronizar_janela(hwnd);
-        log_debug(&format!("monitor_window: sincronizar_janela res={:?}", res.is_ok()));
+        log_debug(&format!("monitor_window: sincronizar res={:?}", res.is_ok()));
 
         res
     }
 
     /// Sincroniza o controle visual de abas e redimensionamento de uma janela específica.
+    /// DEVE ser chamado da thread de UI do Office (WM_TIMER, WM_APP, WM_SIZE).
     pub fn sincronizar_janela(&mut self, hwnd: HWND) -> Result<()> {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
@@ -129,7 +161,7 @@ impl TabManager {
             let largura_cliente = rc_client.right - rc_client.left;
             let altura_cliente = rc_client.bottom - rc_client.top;
 
-            // Se minimizada ou sem dimensões, ignora temporariamente
+            // Se minimizada ou sem dimensões, ignorar temporariamente
             if largura_cliente <= 0 || altura_cliente <= 0 {
                 return Ok(());
             }
@@ -154,7 +186,7 @@ impl TabManager {
             } else if !xldesk.is_invalid() {
                 xldesk
             } else {
-                // Ainda na tela inicial de boas-vindas sem documento ativo aberto
+                // Ainda na tela inicial de boas-vindas sem documento ativo
                 return Ok(());
             };
 
@@ -172,7 +204,7 @@ impl TabManager {
             }
             estado.hwnd_doc_view = Some(doc_view);
 
-            // Criar controle de abas se ainda não existir
+            // Criar controle de abas se ainda não existir (estamos na thread de UI — seguro)
             if estado.tab_control.is_none() {
                 match TabControl::new(
                     hwnd,
@@ -184,7 +216,7 @@ impl TabManager {
                 ) {
                     Ok(tab) => {
                         log_debug(&format!(
-                            "TabControl CRIADO COM SUCESSO: HWND=0x{:X}, pai=0x{:X}",
+                            "TabControl CRIADO (thread UI): HWND=0x{:X}, pai=0x{:X}",
                             tab.hwnd.0 as usize, hwnd.0 as usize
                         ));
                         estado.tab_control = Some(tab);
@@ -199,10 +231,10 @@ impl TabManager {
             }
 
             // Deslocar a área do documento para baixo da barra de abas
-            if let Some(doc_view) = estado.hwnd_doc_view {
+            if let Some(dv) = estado.hwnd_doc_view {
                 let y_doc = estado.y_base + ALTURA_BARRA_ABAS;
                 let h_doc = (altura_cliente - y_doc).max(10);
-                let _ = MoveWindow(doc_view, 0, y_doc, largura_cliente, h_doc, true);
+                let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
             }
 
             // Coletar documentos abertos para popular as abas
@@ -308,6 +340,11 @@ impl TabManager {
         self.estados.clear();
         self.subclass_manager.unsubclass_all();
     }
+
+    /// Retorna true se o HWND já está sendo monitorado.
+    pub fn esta_monitorado(&self, hwnd: HWND) -> bool {
+        self.estados.contains_key(&(hwnd.0 as isize))
+    }
 }
 
 impl Drop for TabManager {
@@ -322,24 +359,59 @@ impl Default for TabManager {
     }
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Singleton Global, Despacho de Eventos Subclass e Thread de Monitoramento
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 static GLOBAL_TAB_MANAGER: Mutex<Option<TabManager>> = Mutex::new(None);
 static MONITORAMENTO_ATIVO: AtomicBool = AtomicBool::new(false);
 
-/// Inicia uma thread de background contínua para monitorar e anexar novas janelas do Office.
+/// Inicia uma thread de background para APENAS detectar novas janelas do Office.
+/// A thread NUNCA cria ou move janelas Win32 — apenas posta WM_OFFICETAB_INICIALIZAR
+/// para que a thread de UI do Office faça a inicialização segura.
 pub fn iniciar_thread_monitoramento() {
     if MONITORAMENTO_ATIVO.swap(true, Ordering::SeqCst) {
-        return;
+        return; // Já está rodando
     }
 
     std::thread::spawn(|| {
+        log_debug("Thread de monitoramento REA iniciada");
+
         while MONITORAMENTO_ATIVO.load(Ordering::Relaxed) {
-            varrer_e_anexar_janelas();
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            // Detectar janelas do Office no processo atual
+            let janelas = listar_janelas_processo();
+
+            for (hwnd, _titulo) in janelas {
+                // Verificar se esta janela já está sendo monitorada
+                let ja_monitorada = GLOBAL_TAB_MANAGER
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|m| m.esta_monitorado(hwnd)))
+                    .unwrap_or(false);
+
+                if !ja_monitorada {
+                    // REA: Postar mensagem para a thread de UI do OpusApp
+                    // PostMessageW NÃO bloqueia — retorna imediatamente
+                    // A thread de UI recebe a mensagem e faz o subclassing + criação
+                    unsafe {
+                        let _ = PostMessageW(
+                            hwnd,
+                            WM_OFFICETAB_INICIALIZAR,
+                            windows::Win32::Foundation::WPARAM(0),
+                            windows::Win32::Foundation::LPARAM(0),
+                        );
+                    }
+                    log_debug(&format!(
+                        "REA: PostMessage WM_OFFICETAB_INICIALIZAR → HWND=0x{:X}",
+                        hwnd.0 as usize
+                    ));
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(600));
         }
+
+        log_debug("Thread de monitoramento REA encerrada");
     });
 }
 
@@ -348,12 +420,17 @@ pub fn obter_ou_criar_gerenciador() {
     if guard.is_none() {
         *guard = Some(TabManager::new());
     }
+    drop(guard); // Libera o lock antes de iniciar a thread
     iniciar_thread_monitoramento();
 }
 
-pub fn despachar_timer(hwnd: HWND) {
-    varrer_e_anexar_janelas();
+// ---------------------------------------------------------------------------
+// Despacho de eventos de janela (SOMENTE chamados da thread de UI do Office)
+// ---------------------------------------------------------------------------
 
+/// Chamado via WM_TIMER na thread de UI do OpusApp.
+/// Atualiza abas e layout — seguro pois WM_TIMER sempre chega na thread correta.
+pub fn despachar_timer(hwnd: HWND) {
     if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
         && let Some(ref mut manager) = *guard
     {
@@ -361,6 +438,7 @@ pub fn despachar_timer(hwnd: HWND) {
     }
 }
 
+/// Chamado via WM_SIZE na thread de UI do OpusApp.
 pub fn despachar_size(hwnd: HWND) {
     if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
         && let Some(ref mut manager) = *guard
@@ -369,6 +447,7 @@ pub fn despachar_size(hwnd: HWND) {
     }
 }
 
+/// Chamado via WM_NOTIFY na thread de UI do OpusApp.
 pub fn despachar_notify(hwnd: HWND, lparam: LPARAM) {
     if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
         && let Some(ref mut manager) = *guard
@@ -377,6 +456,7 @@ pub fn despachar_notify(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
+/// Chamado via WM_DESTROY/WM_NCDESTROY na thread de UI do OpusApp.
 pub fn despachar_destroy(hwnd: HWND) {
     if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
         && let Some(ref mut manager) = *guard
@@ -385,6 +465,40 @@ pub fn despachar_destroy(hwnd: HWND) {
     }
 }
 
+/// Chamado via WM_OFFICETAB_INICIALIZAR na thread de UI do OpusApp.
+/// Realiza o subclassing e a criação do TabControl com segurança de thread.
+pub fn despachar_inicializar(hwnd: HWND) {
+    log_debug(&format!("despachar_inicializar (thread UI): HWND=0x{:X}", hwnd.0 as usize));
+
+    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
+        if guard.is_none() {
+            *guard = Some(TabManager::new());
+        }
+        if let Some(ref mut manager) = *guard {
+            if !manager.esta_monitorado(hwnd) {
+                let res = manager.monitor_window(hwnd);
+                log_debug(&format!("despachar_inicializar: monitor_window res={:?}", res.is_ok()));
+            }
+        }
+    }
+}
+
+/// Chamado via WM_OFFICETAB_RECARREGAR na thread de UI do OpusApp.
+/// Força a recarga de abas quando detectada mudança de documentos.
+pub fn despachar_recarregar(hwnd: HWND) {
+    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
+        && let Some(ref mut manager) = *guard
+    {
+        // Forçar limpeza do cache de títulos para garantir recarga
+        if let Some(estado) = manager.estados.get_mut(&(hwnd.0 as isize)) {
+            estado.titulos_cache.clear();
+        }
+        let _ = manager.sincronizar_janela(hwnd);
+    }
+}
+
+/// Varre e anexa o gerenciamento às janelas ativas do Office.
+/// ATENÇÃO: Este método realiza operações de UI — chamar apenas da thread de UI!
 pub fn varrer_e_anexar_janelas() {
     let janelas = listar_janelas_processo();
     if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
@@ -408,9 +522,9 @@ pub fn desativar_gerenciador_global() {
     }
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Funções Auxiliares Win32
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 /// Envia o atalho Ctrl+N para abrir um novo documento na aplicação hospedeira.
 fn criar_novo_documento() {
