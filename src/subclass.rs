@@ -136,6 +136,7 @@ fn procedimento_subclass_interno(
 ) -> LRESULT {
     const WM_DESTROY: u32 = 0x0002;
     const WM_SIZE: u32 = 0x0005;
+    const WM_WINDOWPOSCHANGED: u32 = 0x0047;
     const WM_NOTIFY: u32 = 0x004E;
     const WM_NCDESTROY: u32 = 0x0082;
     const WM_TIMER: u32 = 0x0113;
@@ -152,8 +153,9 @@ fn procedimento_subclass_interno(
             return LRESULT(0);
         }
 
-        // WM_SIZE: redimensionamento da janela do Office (thread de UI)
-        WM_SIZE => {
+        // WM_SIZE / WM_WINDOWPOSCHANGED: redimensionamento da janela do Office
+        // e reposicionamento de elementos internos (como recolher/expandir Ribbon com Ctrl+F1)
+        WM_SIZE | WM_WINDOWPOSCHANGED => {
             let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
             crate::tab_manager::despachar_size(hwnd);
             return res;

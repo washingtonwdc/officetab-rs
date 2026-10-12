@@ -42,7 +42,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_SHOW, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW, GetClientRect,
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow,
     PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD,
@@ -387,9 +387,14 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
         // para não obstruir o editor de fórmulas fx nem o Name Box.
         let classe_top = extrair_classe_janela(hwnd_top);
         if obter_tipo_app(&classe_top) == TipoAppOffice::Excel {
-            let formula_bar =
+            let mut formula_bar =
                 FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL<"), PCWSTR::null())
                     .unwrap_or_default();
+            if formula_bar.is_invalid() || !IsWindowVisible(formula_bar).as_bool() {
+                formula_bar =
+                    FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL;"), PCWSTR::null())
+                        .unwrap_or_default();
+            }
             if !formula_bar.is_invalid() && IsWindowVisible(formula_bar).as_bool() {
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(formula_bar, &mut rc);
@@ -399,13 +404,17 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
                 };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.y > escala(40) && pt.y < escala(250) {
-                    return (pt.y + h).clamp(escala(60), escala(280));
+                let bottom = pt.y + h;
+                // A barra de fórmulas pode começar em pt.y ~25-35px quando a Ribbon está recolhida,
+                // ou em pt.y ~120-145px quando a Ribbon está expandida.
+                // Sua borda inferior é exatamente onde a barra de abas deve se ancorar.
+                if pt.y >= 0 && bottom > escala(20) && bottom < escala(350) {
+                    return bottom;
                 }
             }
         }
 
-        // 1. Procurar DropShadow com pt.y > escala(40) e dentro dos limites da Ribbon
+        // 1. Procurar DropShadow com pt.y >= escala(20) e dentro dos limites da Ribbon
         let mut child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("DropShadow"), PCWSTR::null()) {
@@ -421,13 +430,13 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
                 };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.y > escala(40) && pt.y < escala(200) && pt.x == 0 {
-                    return (pt.y + h).clamp(escala(40), escala(220)); // Borda inferior do DropShadow
+                if pt.y >= escala(20) && pt.y < escala(250) && pt.x.abs() <= escala(4) {
+                    return (pt.y + h).clamp(escala(25), escala(280)); // Borda inferior do DropShadow
                 }
             }
         }
 
-        // 2. Procurar MsoCommandBarDock no topo com limites estritos da Ribbon
+        // 2. Procurar MsoCommandBarDock no topo com limites da Ribbon
         child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("MsoCommandBarDock"), PCWSTR::null()) {
@@ -443,13 +452,17 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
                 };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.x == 0 && pt.y <= escala(15) && h > escala(35) && h < escala(210) {
-                    return (pt.y + h).clamp(escala(40), escala(220));
+                if pt.x.abs() <= escala(4)
+                    && pt.y <= escala(25)
+                    && h >= escala(20)
+                    && h < escala(250)
+                {
+                    return (pt.y + h).clamp(escala(25), escala(280));
                 }
             }
         }
 
-        // 3. Procurar NetUIHWND no topo com limites estritos da Ribbon
+        // 3. Procurar NetUIHWND no topo com limites da Ribbon
         child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("NetUIHWND"), PCWSTR::null()) {
@@ -464,15 +477,26 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
                     y: rc.top,
                 };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
+                let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
-                if pt.x == 0 && pt.y <= escala(15) && h > escala(35) && h < escala(210) {
-                    return (pt.y + h).clamp(escala(40), escala(220));
+                if pt.x.abs() <= escala(4)
+                    && pt.y <= escala(25)
+                    && w > escala(200)
+                    && h >= escala(20)
+                    && h < escala(250)
+                {
+                    return (pt.y + h).clamp(escala(25), escala(280));
                 }
             }
         }
 
-        // 4. Fallback pelo topo da área de documento se ainda não deslocada
-        if let Some(doc_view) = localizar_area_documento(hwnd_top) {
+        // 4. Fallback pelo topo da área de documento (apenas se a barra de abas ainda não foi criada)
+        let tab_ja_existe = !GetDlgItem(hwnd_top, OFFICETAB_CONTROL_ID as i32)
+            .unwrap_or_default()
+            .is_invalid();
+        if !tab_ja_existe
+            && let Some(doc_view) = localizar_area_documento(hwnd_top)
+        {
             let mut rc = RECT::default();
             let _ = GetWindowRect(doc_view, &mut rc);
             let mut pt = POINT {
@@ -480,7 +504,7 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
                 y: rc.top,
             };
             let _ = ScreenToClient(hwnd_top, &mut pt);
-            if pt.y > escala(45) && pt.y < escala(220) {
+            if pt.y >= escala(25) && pt.y < escala(250) {
                 return pt.y;
             }
         }
