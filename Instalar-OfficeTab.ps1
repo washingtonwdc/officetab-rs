@@ -11,15 +11,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $DllPath) {
-    if ($PSScriptRoot) {
-        $DllPath = Join-Path $PSScriptRoot "target\release\officetab_rs.dll"
-    } else {
-        $DllPath = "C:\Users\washi\officetab-rs\target\release\officetab_rs.dll"
+    $candidatos = @(
+        (Join-Path $PSScriptRoot "officetab_rs.dll"),
+        (Join-Path $PSScriptRoot "target\release\officetab_rs.dll"),
+        "C:\Users\washi\officetab-rs\target\release\officetab_rs.dll",
+        "C:\Users\washi\officetab-rs\officetab_rs.dll"
+    )
+    foreach ($cand in $candidatos) {
+        if (Test-Path $cand) {
+            $DllPath = $cand
+            break
+        }
     }
-}
-
-if (-not (Test-Path $DllPath)) {
-    $DllPath = "C:\Users\washi\officetab-rs\target\release\officetab_rs.dll"
 }
 
 Write-Host "=== Instalacao do Office Tab Pro (Rust) ===" -ForegroundColor Cyan

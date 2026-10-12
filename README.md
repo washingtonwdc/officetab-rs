@@ -109,42 +109,64 @@ Built with **Vibe Coding**, we welcome contributions from all developers!
 
 ---
 
-## 🚀 Quick Start / Instalação Rápida
+## 🚀 Como Instalar / Installation Options
 
-### Prerequisites
-- Windows 10 or 11 (x64)
-- Microsoft Office (2016, 2019, 2021, or Microsoft 365)
-- [Rust toolchain with MSVC](https://rustup.rs/)
+Você pode instalar o **OfficeTab-rs** de várias maneiras, desde um instalador visual executável até compilação direta do código fonte:
 
-### Build from Source
-```powershell
-# Clone the repository
-git clone https://github.com/Washington/officetab-rs.git
-cd officetab-rs
+### 📦 Opção 1: Instalador Gráfico Windows (Recomendado para Usuários)
+Baixe e execute o instalador oficial gerado com Inno Setup:
+- **Arquivo:** `dist/OfficeTab-rs-Setup-v0.1.0.exe` (2.8 MB)
+- Suporte a Português do Brasil e Inglês
+- Instala a DLL COM x64 e o Painel de Configurações (`officetab-config.exe`)
+- Registra automaticamente o suplemento nos 7 aplicativos do Microsoft Office (Word, Excel, PowerPoint, Access, Project, Visio e Publisher)
+- Cria atalhos no Menu Iniciar e opção de desinstalação no Painel de Controle / Configurações do Windows.
 
-# Run verification and tests (51 unit tests)
-cargo test --lib
-cargo clippy -- -D warnings
-
-# Build release binary
-cargo build --release
+### ⚡ Opção 2: Instalador em 1-Clique (`Instalar.bat`)
+Basta dar duplo clique no arquivo:
+```cmd
+Instalar.bat
 ```
+Ele executa a ativação e registro em segundo plano sem necessidade de abrir terminais. Para remover: `Desinstalar.bat`.
 
-### Install the Add-in
-Run PowerShell as Administrator or under user context:
+### 🧰 Opção 3: Pacote Portátil (`Portable.zip`)
+Ideal para quem não deseja executar instaladores ou para ambientes corporativos:
+- **Arquivo:** `dist/OfficeTab-rs-v0.1.0-Portable.zip` (1.6 MB)
+- Descompacte em qualquer pasta e execute `Instalar.bat` ou `Instalar-OfficeTab.ps1`.
+
+### 💻 Opção 4: Script PowerShell Automatizado
+Execute diretamente no terminal:
 ```powershell
 .\Instalar-OfficeTab.ps1
 ```
-Or register directly via Windows `regsvr32`:
+Para diagnosticar o estado do add-in e verificar integridade:
 ```powershell
-regsvr32 .\target\release\officetab_rs.dll
+.\Testar-OfficeTab.ps1
 ```
-
-### Uninstall
+Para desinstalar:
 ```powershell
 .\Desinstalar-OfficeTab.ps1
-# or:
-regsvr32 /u .\target\release\officetab_rs.dll
+```
+
+### 🛠️ Opção 5: Compilação a partir do Código Fonte (Desenvolvedores)
+#### Pré-requisitos
+- Windows 10 ou 11 (x64)
+- Microsoft Office (2016, 2019, 2021, ou Microsoft 365)
+- [Rust toolchain com MSVC](https://rustup.rs/)
+
+```powershell
+# Clonar repositório
+git clone https://github.com/washingtonwdc/officetab-rs.git
+cd officetab-rs
+
+# Executar suíte de testes (51 testes unitários)
+cargo test --lib
+cargo clippy -- -D warnings
+
+# Compilar binários de produção
+cargo build --release
+
+# Instalar e registrar
+.\Instalar.bat
 ```
 
 ---
