@@ -4,6 +4,15 @@ We welcome all contributors with open arms! Whether you are an experienced Rust 
 
 ---
 
+## 📚 Essential Documentation
+
+Before you start, please check out the following guides:
+- 📖 [**Developer Guide (Deep Dive)**](docs/DEVELOPER_GUIDE.md): Architecture, COM injection lifecycle, window subclassing, debugging inner loop, and roadmaps.
+- 📐 [**Public API Reference**](docs/API.md): Structures, configuration serialization, and themes.
+- 📦 [**Installers & Release Packages Guide**](GUIA_INSTALADORES.md): Details on the Inno Setup installer, 1-click batch scripts, and portable distribution.
+
+---
+
 ## 🎨 Built with Vibe Coding
 
 This codebase was developed using **Vibe Coding** — high-velocity, intent-driven AI pair programming combined with rigorous systems testing (51 passing unit tests, memory safety, zero clippy warnings).
@@ -24,7 +33,7 @@ Here are areas where community help is most needed:
    - Word and Excel are heavily optimized.
    - We need contributors to test and fine-tune window docking for:
      - **PowerPoint** (`PPTFrameClass` / `PP9FrameClass`)
-     - **Access** (`MSACCESS`)
+     - **Access** (`MSACCESS` / `OMain`)
      - **Visio** (`VISIO` / `VISIOA`)
      - **Project** (`PB`)
      - **Publisher** (`PUBLISHER`)
@@ -34,7 +43,11 @@ Here are areas where community help is most needed:
    - Comprehensive Dark Mode presets.
    - Animations and custom tab icons.
 
-4. **🌐 Internationalization (i18n)**:
+4. **⚡ Event-Driven Performance**:
+   - Replacing periodic UI timers with granular `WinEventHook` events (`EVENT_SYSTEM_FOREGROUND`, `EVENT_OBJECT_LOCATIONCHANGE`).
+   - Per-Monitor DPI Aware v2 scaling improvements across multi-monitor setups.
+
+5. **🌐 Internationalization (i18n)**:
    - Translating menus, tooltips, configuration utility, and documentation into more languages.
 
 ---
@@ -44,16 +57,16 @@ Here are areas where community help is most needed:
 Before submitting a Pull Request, please ensure all checks pass:
 
 ```powershell
-# Format code
+# 1. Format code
 cargo fmt -- --check
 
-# Run unit tests (51 tests)
+# 2. Run unit tests (51 tests)
 cargo test --lib
 
-# Run linter
+# 3. Run linter with strict warnings
 cargo clippy -- -D warnings
 
-# Build release DLL
+# 4. Build release binary
 cargo build --release
 ```
 
@@ -64,5 +77,12 @@ cargo build --release
 - **Open Source Integrity**: Clean-room implementation only. Do not copy or decompile proprietary binaries.
 
 ---
+
+## 📬 Pull Request Process
+
+1. **Fork and Branch**: Create a feature branch from `main` (e.g. `feature/powerpoint-fullscreen` or `fix/excel-high-dpi`).
+2. **Commit clearly**: Write meaningful commit messages explaining the rationale behind your Win32/Rust changes.
+3. **Verify locally**: Run `cargo test --lib` and test against real Office instances before opening your PR.
+4. **Submit PR**: Open a Pull Request on GitHub describing your changes, any tests performed, and screenshots if UI changes are involved.
 
 Thank you for helping make OfficeTab-rs amazing! ⭐
