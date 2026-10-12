@@ -115,7 +115,7 @@ Você pode instalar o **OfficeTab-rs** de várias maneiras, desde um instalador 
 
 ### 📦 Opção 1: Instalador Gráfico Windows (Recomendado para Usuários)
 Baixe e execute o instalador oficial gerado com Inno Setup:
-- **Arquivo:** `dist/OfficeTab-rs-Setup-v0.1.0.exe` (2.8 MB)
+- **Download Direto:** [**`installers/OfficeTab-rs-Setup-v0.1.0.exe`**](./installers/OfficeTab-rs-Setup-v0.1.0.exe) (2.85 MB)
 - Suporte a Português do Brasil e Inglês
 - Instala a DLL COM x64 e o Painel de Configurações (`officetab-config.exe`)
 - Registra automaticamente o suplemento nos 7 aplicativos do Microsoft Office (Word, Excel, PowerPoint, Access, Project, Visio e Publisher)
@@ -130,7 +130,7 @@ Ele executa a ativação e registro em segundo plano sem necessidade de abrir te
 
 ### 🧰 Opção 3: Pacote Portátil (`Portable.zip`)
 Ideal para quem não deseja executar instaladores ou para ambientes corporativos:
-- **Arquivo:** `dist/OfficeTab-rs-v0.1.0-Portable.zip` (1.6 MB)
+- **Download Direto:** [**`installers/OfficeTab-rs-v0.1.0-Portable.zip`**](./installers/OfficeTab-rs-v0.1.0-Portable.zip) (1.66 MB)
 - Descompacte em qualquer pasta e execute `Instalar.bat` ou `Instalar-OfficeTab.ps1`.
 
 ### 💻 Opção 4: Script PowerShell Automatizado

@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  create-release:
+    name: Build & Release OfficeTab-rs
+    runs-on: windows-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Release Binaries
+        run: cargo build --release
+
+      - name: Compile Inno Setup Installer
+        run: |
+          iscc installer.iss
+
+      - name: Create Portable Zip
+        run: |
+          $portableDir = "dist/portable"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item "target/release/officetab_rs.dll" $portableDir -Force
+          Copy-Item "target/release/officetab-config.exe" $portableDir -Force
+          Copy-Item "Instalar.bat" $portableDir -Force
+          Copy-Item "Desinstalar.bat" $portableDir -Force
+          Copy-Item "Configurar.bat" $portableDir -Force
+          Copy-Item "Testar.bat" $portableDir -Force
+          Copy-Item "Instalar-OfficeTab.ps1" $portableDir -Force
+          Copy-Item "Desinstalar-OfficeTab.ps1" $portableDir -Force
+          Copy-Item "Testar-OfficeTab.ps1" $portableDir -Force
+          Copy-Item "README.md" $portableDir -Force
+          Copy-Item "LICENSE" $portableDir -Force
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "dist/OfficeTab-rs-${{ github.ref_name }}-Portable.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.zip
+          generate_release_notes: true
