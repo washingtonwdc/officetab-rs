@@ -26,9 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, ScreenToClient,
-    SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, TRANSPARENT,
+    ClientToScreen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, ScreenToClient, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -36,7 +36,9 @@ use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_NOTIFYITEMDRAW,
     CDRF_SKIPDEFAULT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, TCN_SELCHANGE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, SetFocus, VK_CONTROL, keybd_event};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    KEYEVENTF_KEYUP, SetFocus, VK_CONTROL, keybd_event,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_SHOW, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW, GetClientRect,
@@ -140,11 +142,11 @@ impl TipoAppOffice {
 /// Reconhece com precisão os 7 aplicativos originais mapeados pelo relatório de engenharia reversa:
 /// - Word: OpusApp
 /// - Excel: XLMAIN, EXCEL7, EXCEL2
-/// - PowerPoint: PPTFrameClass
-/// - Access: MSACCESS
-/// - Project: PB
-/// - Visio: VISIO
-/// - Publisher: PUBLISHER
+/// - PowerPoint: PPTFrameClass, PP9FrameClass, PP10FrameClass, PP11FrameClass, PP12FrameClass
+/// - Access: MSACCESS, OMain, AccessApp
+/// - Project: PB, WINPROJ, Project
+/// - Visio: VISIO, VISIOA, VISIOM, VISIOU
+/// - Publisher: PUBLISHER, MSPUB, PUBDesk
 pub fn obter_tipo_app(classe: &str) -> TipoAppOffice {
     if classe.eq_ignore_ascii_case("OpusApp") {
         TipoAppOffice::Word
@@ -153,15 +155,36 @@ pub fn obter_tipo_app(classe: &str) -> TipoAppOffice {
         .any(|c| classe.eq_ignore_ascii_case(c))
     {
         TipoAppOffice::Excel
-    } else if classe.eq_ignore_ascii_case("PPTFrameClass") {
+    } else if [
+        "PPTFrameClass",
+        "PP9FrameClass",
+        "PP10FrameClass",
+        "PP11FrameClass",
+        "PP12FrameClass",
+    ]
+    .iter()
+    .any(|c| classe.eq_ignore_ascii_case(c))
+    {
         TipoAppOffice::PowerPoint
-    } else if classe.eq_ignore_ascii_case("MSACCESS") {
+    } else if ["MSACCESS", "OMain", "AccessApp"]
+        .iter()
+        .any(|c| classe.eq_ignore_ascii_case(c))
+    {
         TipoAppOffice::Access
-    } else if classe.eq_ignore_ascii_case("PB") {
+    } else if ["PB", "WINPROJ", "Project"]
+        .iter()
+        .any(|c| classe.eq_ignore_ascii_case(c))
+    {
         TipoAppOffice::Project
-    } else if classe.eq_ignore_ascii_case("VISIO") {
+    } else if ["VISIO", "VISIOA", "VISIOM", "VISIOU"]
+        .iter()
+        .any(|c| classe.eq_ignore_ascii_case(c))
+    {
         TipoAppOffice::Visio
-    } else if classe.eq_ignore_ascii_case("PUBLISHER") {
+    } else if ["PUBLISHER", "MSPUB", "PUBDesk"]
+        .iter()
+        .any(|c| classe.eq_ignore_ascii_case(c))
+    {
         TipoAppOffice::Publisher
     } else {
         TipoAppOffice::Desconhecido
@@ -178,14 +201,27 @@ pub const OFFICE_WINDOW_CLASSES: &[&str] = &[
     "EXCEL2",
     // Microsoft PowerPoint
     "PPTFrameClass",
+    "PP9FrameClass",
+    "PP10FrameClass",
+    "PP11FrameClass",
+    "PP12FrameClass",
     // Microsoft Access
     "MSACCESS",
+    "OMain",
+    "AccessApp",
     // Microsoft Project
     "PB",
+    "WINPROJ",
+    "Project",
     // Microsoft Visio
     "VISIO",
+    "VISIOA",
+    "VISIOM",
+    "VISIOU",
     // Microsoft Publisher
     "PUBLISHER",
+    "MSPUB",
+    "PUBDesk",
 ];
 
 /// Localiza a janela interna de documento (MDI client desk ou área de visualização) para os 7 aplicativos Office.
@@ -193,15 +229,20 @@ pub const OFFICE_WINDOW_CLASSES: &[&str] = &[
 pub fn localizar_area_documento(hwnd_top: HWND) -> Option<HWND> {
     unsafe {
         const CLASSES_DOC: &[PCWSTR] = &[
-            w!("_WwF"),
-            w!("XLDESK"),
-            w!("MDIClient"),
-            w!("MDICLIENT"),
-            w!("paneClassDC"),
-            w!("PP9FrameClass"),
-            w!("VISIOA"),
-            w!("ViewDesk"),
-            w!("_WwG"),
+            w!("_WwF"),          // Word
+            w!("XLDESK"),        // Excel MDI desk
+            w!("paneClassDC"),   // PowerPoint slide canvas
+            w!("PP9FrameClass"), // PowerPoint legacy frame
+            w!("MDIClient"),     // Access / Visio / Project / PowerPoint MDI
+            w!("MDICLIENT"),     // Access MDI alternativo
+            w!("VISIOA"),        // Visio workspace
+            w!("VISIOM"),        // Visio main view
+            w!("ViewDesk"),      // Project / Visio desktop
+            w!("ProjDesk"),      // Project desk
+            w!("PBView"),        // Project view
+            w!("PUBDesk"),       // Publisher layout desk
+            w!("mdiClass"),      // Modern Office MDI container
+            w!("_WwG"),          // Word document edit area
         ];
 
         for &classe in CLASSES_DOC {
@@ -212,13 +253,63 @@ pub fn localizar_area_documento(hwnd_top: HWND) -> Option<HWND> {
                 let _ = GetWindowRect(child, &mut rc);
                 let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
-                if w > 100 && h > 100 {
+                if w > 80 && h > 80 {
                     return Some(child);
                 }
             }
         }
 
         None
+    }
+}
+
+/// Calcula a altura da barra de status no rodapé da janela do Office (se presente),
+/// garantindo que a área do documento não se sobreponha à barra de status nos 7 aplicativos.
+pub fn calcular_altura_status_bar(hwnd_top: HWND, altura_cliente: i32) -> i32 {
+    unsafe {
+        let sb = FindWindowExW(
+            hwnd_top,
+            HWND::default(),
+            w!("msctls_statusbar32"),
+            PCWSTR::null(),
+        )
+        .unwrap_or_default();
+        if !sb.is_invalid() && IsWindowVisible(sb).as_bool() {
+            let mut rc = RECT::default();
+            if GetWindowRect(sb, &mut rc).is_ok() {
+                let h = rc.bottom - rc.top;
+                if (16..=48).contains(&h) {
+                    return h;
+                }
+            }
+        }
+
+        let mut child = HWND::default();
+        loop {
+            child = match FindWindowExW(hwnd_top, child, PCWSTR::null(), PCWSTR::null()) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => break,
+            };
+            if IsWindowVisible(child).as_bool() {
+                let mut rc = RECT::default();
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let mut pt = POINT {
+                        x: rc.left,
+                        y: rc.top,
+                    };
+                    let _ = ScreenToClient(hwnd_top, &mut pt);
+                    let h = rc.bottom - rc.top;
+                    if pt.y >= altura_cliente - 36
+                        && pt.y < altura_cliente
+                        && (18..=36).contains(&h)
+                    {
+                        return h;
+                    }
+                }
+            }
+        }
+
+        24 // Altura padrão do rodapé nos aplicativos Office modernos
     }
 }
 
@@ -296,8 +387,9 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
         // para não obstruir o editor de fórmulas fx nem o Name Box.
         let classe_top = extrair_classe_janela(hwnd_top);
         if obter_tipo_app(&classe_top) == TipoAppOffice::Excel {
-            let formula_bar = FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL<"), PCWSTR::null())
-                .unwrap_or_default();
+            let formula_bar =
+                FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL<"), PCWSTR::null())
+                    .unwrap_or_default();
             if !formula_bar.is_invalid() && IsWindowVisible(formula_bar).as_bool() {
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(formula_bar, &mut rc);
@@ -550,8 +642,7 @@ impl TabManager {
 
         log_debug(&format!(
             "Alternado foco de HWND=0x{:X} para HWND=0x{:X} (Modo Janela Única)",
-            hwnd_origem.0 as usize,
-            hwnd_alvo.0 as usize
+            hwnd_origem.0 as usize, hwnd_alvo.0 as usize
         ));
     }
 
@@ -654,7 +745,8 @@ impl TabManager {
             {
                 let y_doc = y_ribbon + altura_barra;
                 if layout_mudou || y_doc != estado.ult_y_doc {
-                    let h_doc = (altura_cliente - y_doc - 24).max(10);
+                    let h_status = calcular_altura_status_bar(hwnd, altura_cliente);
+                    let h_doc = (altura_cliente - y_doc - h_status).max(10);
                     let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
                     estado.ult_y_doc = y_doc;
                 }
@@ -887,7 +979,10 @@ impl TabManager {
                 };
 
                 let _ = SetBkMode(draw.hdc, TRANSPARENT);
-                let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(text_color)));
+                let _ = SetTextColor(
+                    draw.hdc,
+                    COLORREF(crate::theme::Theme::to_colorref(text_color)),
+                );
 
                 let mut plus_str: [u16; 1] = [b'+' as u16];
                 let mut text_rc = btn_rc;
@@ -915,7 +1010,8 @@ impl TabManager {
 
                 if selected {
                     // Indicador de destaque premium (Accent Bar de 3px no topo)
-                    let accent_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(accent_color)));
+                    let accent_brush =
+                        CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(accent_color)));
                     let accent_rc = RECT {
                         left: rc.left,
                         top: rc.top,
@@ -945,7 +1041,9 @@ impl TabManager {
                     let _ = DeleteObject(border_brush);
 
                     // A base da aba ativa conecta perfeitamente ao documento
-                    let active_base_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(theme.active_tab_bg)));
+                    let active_base_brush = CreateSolidBrush(COLORREF(
+                        crate::theme::Theme::to_colorref(theme.active_tab_bg),
+                    ));
                     let base_rc = RECT {
                         left: rc.left + 1,
                         top: rc.bottom - 1,
@@ -975,7 +1073,11 @@ impl TabManager {
                 };
 
                 let show_close = theme.show_close_button;
-                let text_right = if show_close { rc.right - 24 } else { rc.right - 8 };
+                let text_right = if show_close {
+                    rc.right - 24
+                } else {
+                    rc.right - 8
+                };
                 let mut text_rc = RECT {
                     left: rc.left + 12,
                     top: rc.top,
@@ -992,7 +1094,10 @@ impl TabManager {
                 };
 
                 let _ = SetBkMode(draw.hdc, TRANSPARENT);
-                let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(text_color)));
+                let _ = SetTextColor(
+                    draw.hdc,
+                    COLORREF(crate::theme::Theme::to_colorref(text_color)),
+                );
 
                 let mut utf16: Vec<u16> = titulo.encode_utf16().collect();
                 let _ = DrawTextW(
@@ -1033,19 +1138,27 @@ impl TabManager {
                             right: close_x + close_size + 2,
                             bottom: close_y + close_size + 2,
                         };
-                        let red_bg_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(0x00FDE7E9)));
+                        let red_bg_brush = CreateSolidBrush(COLORREF(
+                            crate::theme::Theme::to_colorref(0x00FDE7E9),
+                        ));
                         let _ = FillRect(draw.hdc, &bg_hover_rc, red_bg_brush);
                         let _ = DeleteObject(red_bg_brush);
 
                         // Glyph '×' em vermelho carmesim Fluent vivo
-                        let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(0x00C42B1C)));
+                        let _ = SetTextColor(
+                            draw.hdc,
+                            COLORREF(crate::theme::Theme::to_colorref(0x00C42B1C)),
+                        );
                     } else {
                         let close_color = if selected {
                             0x00507A5E // Verde suave elegante harmonizado com o tom esverdeado da aba ativa
                         } else {
                             0x008A8886 // Cinza sutil para aba inativa
                         };
-                        let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(close_color)));
+                        let _ = SetTextColor(
+                            draw.hdc,
+                            COLORREF(crate::theme::Theme::to_colorref(close_color)),
+                        );
                     }
 
                     let mut x_glyph: [u16; 1] = [0x00D7]; // '×' (U+00D7)
@@ -1094,15 +1207,19 @@ impl TabManager {
                     "Documento"
                 };
 
-                let tooltip_text = if let Some(caminho) = crate::utils::localizar_caminho_documento(titulo) {
-                    format!("{}\n{}", titulo, caminho.display())
-                } else {
-                    format!("{}\n[Documento Ativo]", titulo)
-                };
+                let tooltip_text =
+                    if let Some(caminho) = crate::utils::localizar_caminho_documento(titulo) {
+                        format!("{}\n{}", titulo, caminho.display())
+                    } else {
+                        format!("{}\n[Documento Ativo]", titulo)
+                    };
 
                 static TOOLTIP_BUFFER: Mutex<Vec<u16>> = Mutex::new(Vec::new());
                 if let Ok(mut buf) = TOOLTIP_BUFFER.lock() {
-                    *buf = tooltip_text.encode_utf16().chain(std::iter::once(0)).collect();
+                    *buf = tooltip_text
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
                     unsafe {
                         let p_disp = &mut *(lparam.0 as *mut NMTTDISPINFOW);
                         p_disp.lpszText = buf.as_mut_ptr();
@@ -1112,7 +1229,9 @@ impl TabManager {
             } else if (idx as usize) == total_docs {
                 static TOOLTIP_NOVO: Mutex<Vec<u16>> = Mutex::new(Vec::new());
                 if let Ok(mut buf) = TOOLTIP_NOVO.lock() {
-                    *buf = "Novo Documento (Ctrl+O / Ctrl+T)\0".encode_utf16().collect();
+                    *buf = "Novo Documento (Ctrl+O / Ctrl+T)\0"
+                        .encode_utf16()
+                        .collect();
                     unsafe {
                         let p_disp = &mut *(lparam.0 as *mut NMTTDISPINFOW);
                         p_disp.lpszText = buf.as_mut_ptr();
@@ -1125,21 +1244,77 @@ impl TabManager {
     }
 
     fn tema_da_janela(&self, hwnd: HWND) -> crate::theme::Theme {
-        let app_name = obter_tipo_app(&extrair_classe_janela(hwnd)).nome();
-        let app_opt = crate::theme::OfficeApp::from_name(app_name);
+        let app_tipo = obter_tipo_app(&extrair_classe_janela(hwnd));
+        let app_opt = crate::theme::OfficeApp::from_name(app_tipo.nome());
 
-        let mut theme = if self.config.general.adaptive_theme_by_app && let Some(app) = app_opt {
+        let mut theme = if self.config.general.adaptive_theme_by_app
+            && let Some(app) = app_opt
+        {
             crate::theme::Theme::for_app(app)
         } else {
             self.config.theme.clone()
         };
 
-        // Ao clicar nas abas elas ganham um tom esverdeado elegante e moderno:
-        theme.active_tab_bg = 0x00EBF5EF;             // Tom esverdeado suave (pastel sage / mint)
-        theme.active_tab_text = 0x000F5132;           // Verde floresta escuro de alta nitidez
-        theme.hover_tab_bg = 0x00F0FAF3;              // Hover sutilmente esverdeado
-        theme.tab_border = 0x00C4DFCE;                // Borda suave em harmonia
-        theme.custom_accent_color = Some(0x00107C41); // Accent Bar verde esmeralda no topo da aba ativa
+        // Aplica o design visual com cantos arredondados, realce dinâmico e paleta de alto contraste
+        // personalizada de acordo com o aplicativo host do Office (Word, Excel, PowerPoint, Access, Project, Visio, Publisher):
+        match app_tipo {
+            TipoAppOffice::Word => {
+                theme.active_tab_bg = 0x00EBF1FB; // Azul gelo suave pastel
+                theme.active_tab_text = 0x00185ABD; // Azul Word nítido
+                theme.hover_tab_bg = 0x00F0F5FD; // Hover azul sutil
+                theme.tab_border = 0x00B8D0F0; // Borda harmônica
+                theme.custom_accent_color = Some(0x00185ABD); // Accent bar azul Word
+            }
+            TipoAppOffice::Excel => {
+                theme.active_tab_bg = 0x00EBF5EF; // Verde sálvia suave pastel
+                theme.active_tab_text = 0x000F5132; // Verde Excel floresta
+                theme.hover_tab_bg = 0x00F0FAF3; // Hover verde sutil
+                theme.tab_border = 0x00C4DFCE; // Borda verde sálvia
+                theme.custom_accent_color = Some(0x00107C41); // Accent bar verde esmeralda
+            }
+            TipoAppOffice::PowerPoint => {
+                theme.active_tab_bg = 0x00FDF0EC; // Pêssego/carmim suave pastel
+                theme.active_tab_text = 0x00A02C0E; // Carmim PowerPoint
+                theme.hover_tab_bg = 0x00FFF5F2; // Hover pêssego sutil
+                theme.tab_border = 0x00F5C8BC; // Borda carmim pastel
+                theme.custom_accent_color = Some(0x00C43E1C); // Accent bar laranja/carmim
+            }
+            TipoAppOffice::Access => {
+                theme.active_tab_bg = 0x00FBF0F1; // Vinho/rosa suave pastel
+                theme.active_tab_text = 0x00802225; // Vinho Access
+                theme.hover_tab_bg = 0x00FDF5F6; // Hover vinho sutil
+                theme.tab_border = 0x00E8BFC1; // Borda vinho pastel
+                theme.custom_accent_color = Some(0x00A4373A); // Accent bar vinho Access
+            }
+            TipoAppOffice::Project => {
+                theme.active_tab_bg = 0x00EFF6EF; // Verde menta suave pastel
+                theme.active_tab_text = 0x0020521E; // Verde Project floresta
+                theme.hover_tab_bg = 0x00F5FAF5; // Hover verde menta
+                theme.tab_border = 0x00BFDDBE; // Borda verde pastel
+                theme.custom_accent_color = Some(0x0031752F); // Accent bar verde Project
+            }
+            TipoAppOffice::Visio => {
+                theme.active_tab_bg = 0x00EFF2FA; // Lavanda/índigo suave pastel
+                theme.active_tab_text = 0x00243870; // Índigo Visio
+                theme.hover_tab_bg = 0x00F5F7FC; // Hover índigo sutil
+                theme.tab_border = 0x00BDCCEB; // Borda índigo pastel
+                theme.custom_accent_color = Some(0x003955A3); // Accent bar índigo Visio
+            }
+            TipoAppOffice::Publisher => {
+                theme.active_tab_bg = 0x00EBF6F5; // Turquesa/água suave pastel
+                theme.active_tab_text = 0x00005C51; // Turquesa Publisher escuro
+                theme.hover_tab_bg = 0x00F2FAF9; // Hover turquesa sutil
+                theme.tab_border = 0x00A3DAD4; // Borda turquesa pastel
+                theme.custom_accent_color = Some(0x00008272); // Accent bar turquesa Publisher
+            }
+            TipoAppOffice::Desconhecido => {
+                theme.active_tab_bg = 0x00EBF1FB;
+                theme.active_tab_text = 0x00185ABD;
+                theme.hover_tab_bg = 0x00F0F5FD;
+                theme.tab_border = 0x00B8D0F0;
+                theme.custom_accent_color = Some(0x00185ABD);
+            }
+        }
 
         theme
     }
@@ -1162,9 +1337,11 @@ impl TabManager {
         // Se a janela destruída era a janela visível ativa, restaurar e exibir
         // imediatamente a próxima janela restante da lista para que o Word
         // permaneça visível na tela e na barra de tarefas!
-        let proxima_janela = self.ordem_documentos.first().copied().or_else(|| {
-            self.estados.keys().next().map(|&raw| HWND(raw as *mut _))
-        });
+        let proxima_janela = self
+            .ordem_documentos
+            .first()
+            .copied()
+            .or_else(|| self.estados.keys().next().map(|&raw| HWND(raw as *mut _)));
 
         if let Some(hwnd_restante) = proxima_janela {
             unsafe {
@@ -1172,12 +1349,8 @@ impl TabManager {
                     let _ = ShowWindow(hwnd_restante, SW_SHOW);
                     let _ = BringWindowToTop(hwnd_restante);
                     let _ = SetForegroundWindow(hwnd_restante);
-                    let _ = PostMessageW(
-                        hwnd_restante,
-                        WM_OFFICETAB_RECARREGAR,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
+                    let _ =
+                        PostMessageW(hwnd_restante, WM_OFFICETAB_RECARREGAR, WPARAM(0), LPARAM(0));
                 }
             }
         }
@@ -1248,7 +1421,11 @@ impl TabManager {
                     let close_x = rc_tab.right - close_size - 6;
                     let close_y = rc_tab.top + (rc_tab.bottom - rc_tab.top - close_size) / 2;
 
-                    if x >= close_x - 4 && x <= close_x + close_size + 4 && y >= close_y - 4 && y <= close_y + close_size + 4 {
+                    if x >= close_x - 4
+                        && x <= close_x + close_size + 4
+                        && y >= close_y - 4
+                        && y <= close_y + close_size + 4
+                    {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
                         let doc_origem = estado.hwnd;
                         log_debug(&format!(
@@ -1327,13 +1504,19 @@ impl TabManager {
                     } else if (tab_idx as usize) == total_docs {
                         log_debug("tratar_lbutton_dblclk: novo doc via clique duplo no '+'");
                         unsafe {
-                            let _ = PostMessageW(estado.hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+                            let _ = PostMessageW(
+                                estado.hwnd,
+                                WM_OFFICETAB_NOVO_DOC,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
                         }
                     }
                 } else {
                     log_debug("tratar_lbutton_dblclk: novo doc via clique duplo na barra vazia");
                     unsafe {
-                        let _ = PostMessageW(estado.hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+                        let _ =
+                            PostMessageW(estado.hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
                     }
                 }
                 break;
@@ -1353,10 +1536,18 @@ impl TabManager {
                     let cur = tab.get_selected_tab();
                     let proximo = if delta > 0 {
                         // Scroll para cima/frente: aba anterior
-                        if cur <= 0 { (total - 1) as i32 } else { cur - 1 }
+                        if cur <= 0 {
+                            (total - 1) as i32
+                        } else {
+                            cur - 1
+                        }
                     } else {
                         // Scroll para baixo/trás: próxima aba
-                        if cur >= (total - 1) as i32 { 0 } else { cur + 1 }
+                        if cur >= (total - 1) as i32 {
+                            0
+                        } else {
+                            cur + 1
+                        }
                     };
                     if (proximo as usize) < total {
                         let alvo = estado.doc_hwnds[proximo as usize];
@@ -1382,7 +1573,9 @@ impl TabManager {
     /// - Ctrl+T: Nova aba / documento
     pub fn tratar_keydown(&mut self, hwnd: HWND, vk: usize) -> bool {
         let ctrl_pressionado = unsafe {
-            (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(VK_CONTROL.0 as i32) as u16
+                & 0x8000)
+                != 0
         };
         if !ctrl_pressionado {
             return false;
@@ -1390,13 +1583,18 @@ impl TabManager {
         let shift_pressionado = unsafe {
             (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
                 windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32,
-            ) as u16 & 0x8000) != 0
+            ) as u16
+                & 0x8000)
+                != 0
         };
 
         let (total, cur, doc_hwnds) = match self.estados.get(&(hwnd.0 as isize)) {
             Some(e) => (
                 e.doc_hwnds.len(),
-                e.tab_control.as_ref().map(|t| t.get_selected_tab()).unwrap_or(0),
+                e.tab_control
+                    .as_ref()
+                    .map(|t| t.get_selected_tab())
+                    .unwrap_or(0),
                 e.doc_hwnds.clone(),
             ),
             None => return false,
@@ -1409,9 +1607,17 @@ impl TabManager {
         // VK_TAB = 0x09
         if vk == 0x09 {
             let proximo = if shift_pressionado {
-                if cur <= 0 { (total - 1) as i32 } else { cur - 1 }
+                if cur <= 0 {
+                    (total - 1) as i32
+                } else {
+                    cur - 1
+                }
             } else {
-                if cur >= (total - 1) as i32 { 0 } else { cur + 1 }
+                if cur >= (total - 1) as i32 {
+                    0
+                } else {
+                    cur + 1
+                }
             };
             if (proximo as usize) < total {
                 let alvo = doc_hwnds[proximo as usize];
@@ -1421,7 +1627,9 @@ impl TabManager {
                 }
                 return true;
             }
-        } else if vk == b'W' as usize || vk == 0x73 /* VK_F4 */ {
+        } else if vk == b'W' as usize || vk == 0x73
+        /* VK_F4 */
+        {
             // Ctrl+W ou Ctrl+F4: fechar documento atual
             unsafe {
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1910,29 +2118,33 @@ pub fn despachar_inicializar(hwnd: HWND) {
             if let Some(ref mut manager) = *guard
                 && !manager.esta_monitorado(hwnd)
             {
-                if let Some((&raw_existente, _)) = manager.estados.iter().find(|(raw, _)| **raw != (hwnd.0 as isize)) {
-                    let hwnd_existente = HWND(raw_existente as *mut _);
-                    unsafe {
-                        if IsWindow(hwnd_existente).as_bool() {
-                            if IsZoomed(hwnd_existente).as_bool() {
-                                let _ = ShowWindow(hwnd, SW_MAXIMIZE);
-                            } else {
-                                let mut rc = RECT::default();
-                                if GetWindowRect(hwnd_existente, &mut rc).is_ok() {
-                                    let _ = SetWindowPos(
-                                        hwnd,
-                                        HWND::default(),
-                                        rc.left,
-                                        rc.top,
-                                        rc.right - rc.left,
-                                        rc.bottom - rc.top,
-                                        SWP_NOZORDER,
-                                    );
+                // MODO DE JANELA ÚNICA: Oculta todas as outras janelas de documentos anteriores do processo,
+                // sincronizando posição e tamanho para que apenas a nova janela ativa permaneça visível na tela e barra de tarefas.
+                for &raw_existente in manager.estados.keys() {
+                    if raw_existente != (hwnd.0 as isize) {
+                        let hwnd_existente = HWND(raw_existente as *mut _);
+                        unsafe {
+                            if IsWindow(hwnd_existente).as_bool() {
+                                if IsZoomed(hwnd_existente).as_bool() {
+                                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                                } else {
+                                    let mut rc = RECT::default();
+                                    if GetWindowRect(hwnd_existente, &mut rc).is_ok() {
+                                        let _ = SetWindowPos(
+                                            hwnd,
+                                            HWND::default(),
+                                            rc.left,
+                                            rc.top,
+                                            rc.right - rc.left,
+                                            rc.bottom - rc.top,
+                                            SWP_NOZORDER,
+                                        );
+                                    }
+                                }
+                                if IsWindowVisible(hwnd_existente).as_bool() {
+                                    let _ = ShowWindow(hwnd_existente, SW_HIDE);
                                 }
                             }
-                            // MODO DE JANELA ÚNICA: Oculta a janela anterior para que apenas
-                            // a nova janela ativa do Word permaneça visível na tela e na barra de tarefas.
-                            let _ = ShowWindow(hwnd_existente, SW_HIDE);
                         }
                     }
                 }
@@ -2121,7 +2333,10 @@ pub fn despachar_novo_doc(hwnd: HWND) {
 }
 
 fn criar_novo_documento(hwnd: HWND) {
-    log_debug(&format!("criar_novo_documento chamado para HWND=0x{:X}", hwnd.0 as usize));
+    log_debug(&format!(
+        "criar_novo_documento chamado para HWND=0x{:X}",
+        hwnd.0 as usize
+    ));
 
     // 1. Tentar criar via COM IDispatch (método oficial e confiável em qualquer idioma do Office)
     if crate::com_addin_simple::criar_documento_com() {
@@ -2129,8 +2344,14 @@ fn criar_novo_documento(hwnd: HWND) {
         return;
     }
 
-    // 2. Fallback via teclado/mensagens Win32
-    log_debug("COM indisponível; tentando atalhos de teclado (Ctrl+O / Ctrl+N)");
+    // 2. Fallback via teclado/mensagens Win32 adaptado para cada aplicativo Office
+    let classe = extrair_classe_janela(hwnd);
+    let tipo_app = obter_tipo_app(&classe);
+    log_debug(&format!(
+        "COM indisponível; tentando atalho de teclado para {:?}",
+        tipo_app
+    ));
+
     unsafe {
         if !hwnd.is_invalid() {
             let _ = SetForegroundWindow(hwnd);
@@ -2140,12 +2361,23 @@ fn criar_novo_documento(hwnd: HWND) {
             let _ = SetFocus(foco_alvo);
         }
 
-        // No Word em Português: Ctrl+O cria Novo Documento (Ctrl+N ativa Negrito!)
-        // No Word em Inglês: Ctrl+N cria Novo Documento
-        keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0);
-        keybd_event(b'O', 0, Default::default(), 0);
-        keybd_event(b'O', 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        match tipo_app {
+            TipoAppOffice::Word => {
+                // No Word PT-BR: Ctrl+O cria novo documento (Ctrl+N é negrito)
+                keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0);
+                keybd_event(b'O', 0, Default::default(), 0);
+                keybd_event(b'O', 0, KEYEVENTF_KEYUP, 0);
+                keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            }
+            _ => {
+                // No Excel, PowerPoint, Access, Project, Visio e Publisher:
+                // Ctrl+N cria novo arquivo/pasta/apresentação/banco/projeto/diagrama
+                keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0);
+                keybd_event(b'N', 0, Default::default(), 0);
+                keybd_event(b'N', 0, KEYEVENTF_KEYUP, 0);
+                keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            }
+        }
     }
 }
 
@@ -2188,15 +2420,25 @@ pub fn limpar_titulo_documento(titulo: &str) -> String {
         " - Publisher",
         " [Modo de Compatibilidade]",
         " (Modo de Compatibilidade)",
+        " [Compatibility Mode]",
+        " (Compatibility Mode)",
         " [Somente Leitura]",
         " (Somente Leitura)",
         " [Read-Only]",
         " (Read-Only)",
+        " [Modo de Exibição Protegida]",
+        " (Modo de Exibição Protegida)",
+        " [Protected View]",
+        " (Protected View)",
         " - Salvo",
         " - Salvando...",
         " - Gravado",
+        " - Gravando...",
         " - Saved",
         " - Saving...",
+        " - Não Salvo",
+        " - Não Gravado",
+        " - Unsaved",
         " - Microsoft Word",
         " - Microsoft Excel",
         " - Microsoft PowerPoint",
@@ -2257,7 +2499,10 @@ unsafe extern "system" fn enum_proc_processo(hwnd: HWND, lparam: LPARAM) -> BOOL
                     hwnd,
                     windows::Win32::UI::WindowsAndMessaging::GW_OWNER,
                 );
-                if let Ok(owner_hwnd) = owner && !owner_hwnd.is_invalid() && owner_hwnd.0 as usize != 0 {
+                if let Ok(owner_hwnd) = owner
+                    && !owner_hwnd.is_invalid()
+                    && owner_hwnd.0 as usize != 0
+                {
                     return;
                 }
 
@@ -2272,8 +2517,18 @@ unsafe extern "system" fn enum_proc_processo(hwnd: HWND, lparam: LPARAM) -> BOOL
                 let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
 
-                // Filtrar apenas janelas reais de documentos (com tamanho visível ou minimizadas)
-                if (w > 150 && h > 150) || IsIconic(hwnd).as_bool() {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                let is_document_style = (style
+                    & (windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0
+                        | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME.0))
+                    != 0;
+
+                // Filtrar apenas janelas reais de documentos (com tamanho visível, minimizadas ou ocultadas pelo Modo Janela Única)
+                if ((w > 100 && h > 100)
+                    || IsIconic(hwnd).as_bool()
+                    || !IsWindowVisible(hwnd).as_bool())
+                    && is_document_style
+                {
                     let titulo_limpo = limpar_titulo_documento(&titulo);
                     let janelas = &mut *(lparam.0 as *mut Vec<(HWND, String)>);
                     janelas.push((hwnd, titulo_limpo));
@@ -2358,12 +2613,18 @@ mod testes {
         assert_eq!(obter_tipo_app("EXCEL7"), TipoAppOffice::Excel);
         assert_eq!(obter_tipo_app("EXCEL2"), TipoAppOffice::Excel);
         assert_eq!(obter_tipo_app("PPTFrameClass"), TipoAppOffice::PowerPoint);
+        assert_eq!(obter_tipo_app("PP9FrameClass"), TipoAppOffice::PowerPoint);
+        assert_eq!(obter_tipo_app("PP10FrameClass"), TipoAppOffice::PowerPoint);
         assert_eq!(obter_tipo_app("MSACCESS"), TipoAppOffice::Access);
+        assert_eq!(obter_tipo_app("OMain"), TipoAppOffice::Access);
+        assert_eq!(obter_tipo_app("AccessApp"), TipoAppOffice::Access);
         assert_eq!(obter_tipo_app("PB"), TipoAppOffice::Project);
+        assert_eq!(obter_tipo_app("WINPROJ"), TipoAppOffice::Project);
         assert_eq!(obter_tipo_app("VISIO"), TipoAppOffice::Visio);
+        assert_eq!(obter_tipo_app("VISIOA"), TipoAppOffice::Visio);
         assert_eq!(obter_tipo_app("PUBLISHER"), TipoAppOffice::Publisher);
+        assert_eq!(obter_tipo_app("MSPUB"), TipoAppOffice::Publisher);
         assert_eq!(obter_tipo_app("opusapp"), TipoAppOffice::Word);
-        assert_eq!(obter_tipo_app("XLMAIN"), TipoAppOffice::Excel);
         assert_eq!(obter_tipo_app("PBToolbar"), TipoAppOffice::Desconhecido);
 
         // Nomes amigáveis e flag de suporte
@@ -2442,12 +2703,28 @@ mod testes {
             "Documento Antigo.doc"
         );
         assert_eq!(
+            limpar_titulo_documento("Budget.xlsx [Compatibility Mode] - Excel"),
+            "Budget.xlsx"
+        );
+        assert_eq!(
             limpar_titulo_documento("Pasta1.xlsx - Salvo - Excel"),
             "Pasta1.xlsx"
         );
         assert_eq!(
             limpar_titulo_documento("Relatorio.xlsx [Somente Leitura] - Excel"),
             "Relatorio.xlsx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Relatorio.docx [Read-Only] - Word"),
+            "Relatorio.docx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Contrato.docx [Modo de Exibição Protegida] - Word"),
+            "Contrato.docx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Rascunho.docx - Não Salvo - Word"),
+            "Rascunho.docx"
         );
         assert_eq!(limpar_titulo_documento(""), "Documento");
     }
@@ -2456,6 +2733,11 @@ mod testes {
     fn test_calcular_y_ribbon_com_dpi() {
         let y = calcular_y_ribbon(HWND::default());
         assert!(y >= 100, "Y ribbon deve ser maior que 100: {}", y);
+    }
+
+    #[test]
+    fn test_calcular_altura_status_bar_default() {
+        assert_eq!(calcular_altura_status_bar(HWND::default(), 600), 24);
     }
 
     #[test]

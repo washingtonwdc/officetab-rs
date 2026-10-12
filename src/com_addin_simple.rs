@@ -23,8 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::System::Com::{
-    DISPPARAMS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, IClassFactory, IClassFactory_Impl,
-    IDispatch,
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, IClassFactory, IClassFactory_Impl, IDispatch,
 };
 use windows::Win32::System::Variant::{VT_DISPATCH, VariantClear};
 use windows::core::{
@@ -45,7 +44,9 @@ pub fn salvar_application_dispatch(raw_ptr: *mut c_void) {
         return;
     }
     unsafe {
-        let unk = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IUnknown>(&raw_ptr));
+        let unk = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IUnknown>(
+            &raw_ptr,
+        ));
         let cloned = (*unk).clone();
         let raw = cloned.into_raw();
         if let Ok(mut guard) = OFFICE_APP_DISPATCH.lock() {
@@ -84,7 +85,9 @@ pub fn criar_documento_com() -> bool {
     drop(guard);
 
     unsafe {
-        let app = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IDispatch>(&raw_ptr));
+        let app = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IDispatch>(
+            &raw_ptr,
+        ));
 
         // Nomes das coleções de documentos nos principais apps Office:
         // Word -> "Documents"
@@ -133,7 +136,10 @@ pub fn criar_documento_com() -> bool {
             }
             let raw = &result_col as *const VARIANT as *const RawVariant;
             if (*raw).vt == VT_DISPATCH.0 && !(*raw).pdisp_val.is_null() {
-                let col = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IDispatch>(&(*raw).pdisp_val));
+                let col = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<
+                    *mut c_void,
+                    IDispatch,
+                >(&(*raw).pdisp_val));
                 let mut add_id = 0i32;
                 let add_name = w!("Add");
                 let hr_add_name = col.GetIDsOfNames(&GUID::zeroed(), &add_name, 1, 0, &mut add_id);
