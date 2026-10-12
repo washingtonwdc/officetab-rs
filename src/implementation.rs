@@ -19,19 +19,15 @@
 use windows::Win32::Foundation::HWND;
 use windows::core::Result;
 
-use crate::tab_manager::{JanelaDocumento, TabManager};
+use crate::tab_manager::JanelaDocumento;
 
 /// Estrutura orquestradora do Office Tab
-pub struct OfficeTab {
-    _tab_manager: TabManager,
-}
+pub struct OfficeTab;
 
 impl OfficeTab {
     /// Cria uma nova instância do Office Tab
     pub fn new() -> Self {
-        Self {
-            _tab_manager: TabManager::new(),
-        }
+        Self
     }
 
     /// Inicializa os subsistemas necessários (COM, DPI awareness)
@@ -47,19 +43,28 @@ impl OfficeTab {
         crate::tab_manager::varrer_e_anexar_janelas();
         crate::tab_manager::listar_janelas_processo()
             .into_iter()
-            .map(|(hwnd, titulo)| JanelaDocumento {
-                hwnd,
-                titulo,
-                classe: "OpusApp".to_string(),
+            .map(|(hwnd, titulo)| {
+                let classe = crate::tab_manager::extrair_classe_janela(hwnd);
+                JanelaDocumento {
+                    hwnd,
+                    titulo,
+                    classe,
+                }
             })
             .collect()
     }
 
     /// Anexa monitoramento a uma janela específica de documento
     pub fn handle_document_window(&self, hwnd: HWND) -> Result<()> {
-        crate::tab_manager::varrer_e_anexar_janelas();
-        let mut manager = TabManager::new();
-        manager.monitor_window(hwnd)
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                crate::tab_manager::WM_OFFICETAB_INICIALIZAR,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+        Ok(())
     }
 
     /// Encerra as operações do add-in e remove todos os ganchos do sistema

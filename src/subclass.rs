@@ -100,8 +100,33 @@ impl Default for SubclassManager {
 }
 
 /// Procedimento de janela subclassed.
-/// Todas as mensagens Win32 chegam aqui NA THREAD DE UI DO OFFICE — seguro para Win32.
+/// Todas as mensagens Win32 chegam aqui NA THREAD DE UI DO OFFICE.
+/// Blindado com std::panic::catch_unwind para evitar que qualquer pânico cause desativação do suplemento pelo Office.
 unsafe extern "system" fn procedimento_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    uid_subclass: usize,
+    ref_data: usize,
+) -> LRESULT {
+    let resultado = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        procedimento_subclass_interno(hwnd, msg, wparam, lparam, uid_subclass, ref_data)
+    }));
+
+    match resultado {
+        Ok(res) => res,
+        Err(e) => {
+            crate::tab_manager::log_debug(&format!(
+                "Pânico capturado no procedimento_subclass: {:?}",
+                e
+            ));
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
+fn procedimento_subclass_interno(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -118,6 +143,7 @@ unsafe extern "system" fn procedimento_subclass(
     // Mensagens REA — postadas pela thread de background e recebidas aqui na thread de UI
     let wm_inicializar = crate::tab_manager::WM_OFFICETAB_INICIALIZAR;
     let wm_recarregar = crate::tab_manager::WM_OFFICETAB_RECARREGAR;
+    let wm_novo_doc = crate::tab_manager::WM_OFFICETAB_NOVO_DOC;
 
     match msg {
         // WM_TIMER: atualização periódica (disparado na thread de UI)
@@ -135,7 +161,16 @@ unsafe extern "system" fn procedimento_subclass(
 
         // WM_NOTIFY: notificações do TabControl (clique em aba, etc.)
         WM_NOTIFY => {
-            crate::tab_manager::despachar_notify(hwnd, lparam);
+            if let Some(result) = crate::tab_manager::despachar_notify(hwnd, lparam) {
+                return result;
+            }
+        }
+
+        // WM_KEYDOWN: atalhos de teclado do OfficeTab (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+W, Ctrl+T)
+        0x0100 => {
+            if crate::tab_manager::despachar_keydown(hwnd, wparam.0) {
+                return LRESULT(0);
+            }
         }
 
         // WM_OFFICETAB_INICIALIZAR: REA — postado pela thread de background
@@ -152,8 +187,20 @@ unsafe extern "system" fn procedimento_subclass(
             return LRESULT(0);
         }
 
-        // WM_DESTROY / WM_NCDESTROY: limpeza ao fechar a janela
-        WM_NCDESTROY | WM_DESTROY => {
+        // WM_OFFICETAB_NOVO_DOC: criação assíncrona de novo documento
+        m if m == wm_novo_doc => {
+            crate::tab_manager::despachar_novo_doc(hwnd);
+            return LRESULT(0);
+        }
+
+        // WM_DESTROY: sinaliza destruição da janela para limpeza de estados
+        WM_DESTROY => {
+            crate::tab_manager::despachar_destroy(hwnd);
+        }
+
+        // WM_NCDESTROY: última mensagem da janela. Garante obrigatoriamente
+        // que RemoveWindowSubclass seja executado caso o Office destrua a janela antes do cleanup.
+        WM_NCDESTROY => {
             crate::tab_manager::despachar_destroy(hwnd);
             unsafe {
                 let _ = RemoveWindowSubclass(hwnd, Some(procedimento_subclass), uid_subclass);
@@ -163,6 +210,7 @@ unsafe extern "system" fn procedimento_subclass(
             {
                 set.remove(&(hwnd.0 as isize));
             }
+            return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
         }
 
         _ => {}
@@ -170,4 +218,16 @@ unsafe extern "system" fn procedimento_subclass(
 
     // Encaminha para o próximo procedimento na cadeia (preservando o comportamento nativo do Office)
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    #[test]
+    fn test_subclass_manager_criacao_e_limpeza() {
+        let manager = SubclassManager::new();
+        // Não deve entrar em pânico ao desinscrever tudo quando vazio
+        manager.unsubclass_all();
+    }
 }

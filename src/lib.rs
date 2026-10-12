@@ -29,10 +29,13 @@
 
 pub mod com_addin_simple;
 pub mod implementation;
+pub mod license;
+pub mod persistence;
 pub mod registry_simple;
 pub mod subclass;
 pub mod tab_control;
 pub mod tab_manager;
+pub mod theme;
 pub mod utils;
 
 use std::ffi::c_void;
@@ -86,14 +89,30 @@ pub extern "system" fn DllUnregisterServer() -> windows::core::HRESULT {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn DllInstall(
+    b_install: windows::Win32::Foundation::BOOL,
+    _cmd_line: windows::core::PCWSTR,
+) -> windows::core::HRESULT {
+    if b_install.as_bool() {
+        DllRegisterServer()
+    } else {
+        DllUnregisterServer()
+    }
+}
+
 #[cfg(test)]
 mod testes {
     use super::{DllCanUnloadNow, DllGetClassObject, E_POINTER, S_OK};
+    use std::sync::Mutex;
     use windows::Win32::System::Com::IClassFactory;
     use windows::core::Interface;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn dll_get_class_object_rejeita_ponteiros_nulos() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let resultado =
             unsafe { DllGetClassObject(std::ptr::null(), std::ptr::null(), std::ptr::null_mut()) };
 
@@ -102,11 +121,14 @@ mod testes {
 
     #[test]
     fn dll_can_unload_now_sem_objetos_ativos() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        crate::tab_manager::desativar_gerenciador_global();
         assert_eq!(DllCanUnloadNow(), S_OK);
     }
 
     #[test]
     fn dll_get_class_object_fornece_fabrica_com() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let mut ponteiro = std::ptr::null_mut();
         let resultado = unsafe {
             DllGetClassObject(
@@ -123,6 +145,7 @@ mod testes {
 
     #[test]
     fn inicializacao_officetab_sucesso() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let app = crate::implementation::OfficeTab::new();
         assert!(app.initialize().is_ok());
         let janelas = app.attach_to_active_office();
@@ -133,6 +156,7 @@ mod testes {
 
     #[test]
     fn suporte_completo_idispatch_e_idtextensibility2() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let mut factory_ptr = std::ptr::null_mut();
         let res = unsafe {
             DllGetClassObject(

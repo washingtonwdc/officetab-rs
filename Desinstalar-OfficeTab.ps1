@@ -12,7 +12,7 @@ Write-Host "=== Desinstalacao do Office Tab Pro (Rust) ===" -ForegroundColor Cya
 
 $ProgIds = @("OfficeTabRs.Connect", "OfficeTabs.Connect")
 $Clsids = @("{9a1929ef-1495-413e-993c-326dd15e35df}", "{1c8ba3cd-5248-4611-8a6e-8ccbaf89b651}")
-$Aplicativos = @("Word", "Excel", "PowerPoint")
+$Aplicativos = @("Word", "Excel", "PowerPoint", "Access", "Project", "Visio", "Publisher")
 
 # 1. Remover entradas dos aplicativos Office
 foreach ($ProgId in $ProgIds) {

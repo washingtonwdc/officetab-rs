@@ -15,35 +15,40 @@
 // limitations under the License.
 //!
 //! Gerenciador central de abas do Office (baseado no TOTWindowsManager).
-//! Arquitetura REA: detecção via WinEventHook + Timer na thread UI do Word + thread fallback.
+//! Arquitetura orientada a eventos: WinEventHook e timer UI somente como fallback.
 //! Criação/renderização de janelas Win32 exclusivamente na thread de UI.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::core::{w, PCWSTR, Result};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, ScreenToClient,
+    SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, TRANSPARENT,
+};
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Accessibility::{
-    SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK,
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::Controls::{
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_NOTIFYITEMDRAW,
+    CDRF_SKIPDEFAULT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, TCN_SELCHANGE,
 };
-use windows::Win32::UI::Controls::{NMHDR, TCN_SELCHANGE};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, KEYEVENTF_KEYUP, VK_CONTROL,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, SetFocus, VK_CONTROL, keybd_event};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, FindWindowExW, GetClassNameW, GetClientRect,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindow, IsWindowVisible, KillTimer, MoveWindow, PostMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWL_STYLE, HWND_TOP, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, WS_CLIPCHILDREN,
-    EVENT_OBJECT_SHOW, WINEVENT_OUTOFCONTEXT,
+    AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_SHOW, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW, GetClientRect,
+    GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow,
+    PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT, WM_ACTIVATE, WM_CLOSE, WS_CLIPCHILDREN,
 };
+use windows::core::{PCWSTR, Result, w};
 
+use crate::persistence::OfficeTabConfig;
 use crate::subclass::SubclassManager;
 use crate::tab_control::TabControl;
 
@@ -57,16 +62,24 @@ pub const WM_OFFICETAB_INICIALIZAR: u32 = windows::Win32::UI::WindowsAndMessagin
 /// Mensagem REA: recarga forçada dos títulos/abas.
 pub const WM_OFFICETAB_RECARREGAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x02;
 
+/// Mensagem customizada: criação assíncrona de novo documento.
+pub const WM_OFFICETAB_NOVO_DOC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x03;
+
 // ---------------------------------------------------------------------------
 // Constantes e utilitários de log
 // ---------------------------------------------------------------------------
 
 pub fn log_debug(msg: &str) {
     use std::io::Write;
+    let caminho_log = crate::utils::get_current_module_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("officetab.log")))
+        .unwrap_or_else(|| std::env::temp_dir().join("officetab.log"));
+
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("C:\\Users\\washi\\officetab-rs\\officetab.log")
+        .open(caminho_log)
     {
         let _ = writeln!(f, "[LOG] {}", msg);
     }
@@ -88,6 +101,167 @@ pub struct JanelaDocumento {
     pub classe: String,
 }
 
+/// Enumeração dos 7 aplicativos Microsoft Office suportados e mapeados pela engenharia reversa:
+/// Word, Excel, PowerPoint, Access, Project, Visio e Publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TipoAppOffice {
+    Word,
+    Excel,
+    PowerPoint,
+    Access,
+    Project,
+    Visio,
+    Publisher,
+    Desconhecido,
+}
+
+impl TipoAppOffice {
+    /// Retorna verdadeiro se o tipo de aplicação pertencer a um aplicativo Office mapeado.
+    pub fn e_office(&self) -> bool {
+        !matches!(self, TipoAppOffice::Desconhecido)
+    }
+
+    /// Nome amigável do aplicativo Office para logs e depuração.
+    pub fn nome(&self) -> &'static str {
+        match self {
+            TipoAppOffice::Word => "Word",
+            TipoAppOffice::Excel => "Excel",
+            TipoAppOffice::PowerPoint => "PowerPoint",
+            TipoAppOffice::Access => "Access",
+            TipoAppOffice::Project => "Project",
+            TipoAppOffice::Visio => "Visio",
+            TipoAppOffice::Publisher => "Publisher",
+            TipoAppOffice::Desconhecido => "Desconhecido",
+        }
+    }
+}
+
+/// Identifica o aplicativo Office com base no nome da classe da janela Win32.
+/// Reconhece com precisão os 7 aplicativos originais mapeados pelo relatório de engenharia reversa:
+/// - Word: OpusApp
+/// - Excel: XLMAIN, EXCEL7, EXCEL2
+/// - PowerPoint: PPTFrameClass
+/// - Access: MSACCESS
+/// - Project: PB
+/// - Visio: VISIO
+/// - Publisher: PUBLISHER
+pub fn obter_tipo_app(classe: &str) -> TipoAppOffice {
+    if classe.eq_ignore_ascii_case("OpusApp") {
+        TipoAppOffice::Word
+    } else if ["XLMAIN", "EXCEL7", "EXCEL2"]
+        .iter()
+        .any(|c| classe.eq_ignore_ascii_case(c))
+    {
+        TipoAppOffice::Excel
+    } else if classe.eq_ignore_ascii_case("PPTFrameClass") {
+        TipoAppOffice::PowerPoint
+    } else if classe.eq_ignore_ascii_case("MSACCESS") {
+        TipoAppOffice::Access
+    } else if classe.eq_ignore_ascii_case("PB") {
+        TipoAppOffice::Project
+    } else if classe.eq_ignore_ascii_case("VISIO") {
+        TipoAppOffice::Visio
+    } else if classe.eq_ignore_ascii_case("PUBLISHER") {
+        TipoAppOffice::Publisher
+    } else {
+        TipoAppOffice::Desconhecido
+    }
+}
+
+/// Classes de janela reconhecidas para as 7 aplicações Office
+pub const OFFICE_WINDOW_CLASSES: &[&str] = &[
+    // Microsoft Word
+    "OpusApp",
+    // Microsoft Excel
+    "XLMAIN",
+    "EXCEL7",
+    "EXCEL2",
+    // Microsoft PowerPoint
+    "PPTFrameClass",
+    // Microsoft Access
+    "MSACCESS",
+    // Microsoft Project
+    "PB",
+    // Microsoft Visio
+    "VISIO",
+    // Microsoft Publisher
+    "PUBLISHER",
+];
+
+/// Localiza a janela interna de documento (MDI client desk ou área de visualização) para os 7 aplicativos Office.
+/// Retorna APENAS janelas reais que estejam atualmente visíveis na tela de edição.
+pub fn localizar_area_documento(hwnd_top: HWND) -> Option<HWND> {
+    unsafe {
+        const CLASSES_DOC: &[PCWSTR] = &[
+            w!("_WwF"),
+            w!("XLDESK"),
+            w!("MDIClient"),
+            w!("MDICLIENT"),
+            w!("paneClassDC"),
+            w!("PP9FrameClass"),
+            w!("VISIOA"),
+            w!("ViewDesk"),
+            w!("_WwG"),
+        ];
+
+        for &classe in CLASSES_DOC {
+            let child = FindWindowExW(hwnd_top, HWND::default(), classe, PCWSTR::null())
+                .unwrap_or_default();
+            if !child.is_invalid() && IsWindowVisible(child).as_bool() {
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(child, &mut rc);
+                let w = rc.right - rc.left;
+                let h = rc.bottom - rc.top;
+                if w > 100 && h > 100 {
+                    return Some(child);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Detecta se a janela do Office está na tela inicial ou no modo Backstage (Menu Arquivo / Novo / Abrir).
+pub fn backstage_esta_aberto(hwnd_top: HWND) -> bool {
+    unsafe {
+        let mut rc_client = RECT::default();
+        if GetClientRect(hwnd_top, &mut rc_client).is_err() {
+            return false;
+        }
+        let w_client = rc_client.right - rc_client.left;
+        let h_client = rc_client.bottom - rc_client.top;
+        if w_client <= 100 || h_client <= 100 {
+            return false;
+        }
+
+        // Se a área de documento não existe ou não está visível, o Office está no Backstage/tela inicial
+        if localizar_area_documento(hwnd_top).is_none() {
+            return true;
+        }
+
+        // Verificar se há janela NetUIHWND de grande porte cobrindo mais de 60% da tela (Backstage ativo)
+        let mut child = HWND::default();
+        loop {
+            child = match FindWindowExW(hwnd_top, child, w!("NetUIHWND"), PCWSTR::null()) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => break,
+            };
+            if IsWindowVisible(child).as_bool() {
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(child, &mut rc);
+                let w = rc.right - rc.left;
+                let h = rc.bottom - rc.top;
+                if w > (w_client * 3 / 4) && h > (h_client * 3 / 5) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
 /// Estado interno e visual associado a cada janela principal de documento do Office
 pub struct EstadoJanela {
     pub hwnd: HWND,
@@ -96,6 +270,10 @@ pub struct EstadoJanela {
     pub y_base: i32,
     pub doc_hwnds: Vec<HWND>,
     pub titulos_cache: Vec<String>,
+    pub ult_largura: i32,
+    pub ult_altura: i32,
+    pub ult_y_ribbon: i32,
+    pub ult_y_doc: i32,
 }
 
 unsafe impl Send for EstadoJanela {}
@@ -106,10 +284,36 @@ unsafe impl Sync for EstadoJanela {}
 // ---------------------------------------------------------------------------
 
 /// Calcula a coordenada Y logo abaixo do Ribbon para ancorar a barra de abas.
-/// Detecta dinamicamente DropShadow, MsoCommandBarDock e NetUIHWND no topo.
+/// Detecta dinamicamente DropShadow, MsoCommandBarDock e NetUIHWND no topo,
+/// aplicando verificação completa com DPI awareness e limites estritos da Ribbon.
 pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
+    let dpi = crate::utils::get_dpi_for_window(hwnd_top);
+    let escala = |px: i32| -> i32 { ((px * dpi as i32) + 48) / 96 };
+
     unsafe {
-        // 1. Procurar DropShadow com pt.y > 40
+        // No Microsoft Excel, se a Barra de Fórmulas (EXCEL< / EXCEL;) estiver visível,
+        // a barra de abas deve ficar posicionada IMEDIATAMENTE ABAIXO da barra de fórmulas,
+        // para não obstruir o editor de fórmulas fx nem o Name Box.
+        let classe_top = extrair_classe_janela(hwnd_top);
+        if obter_tipo_app(&classe_top) == TipoAppOffice::Excel {
+            let formula_bar = FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL<"), PCWSTR::null())
+                .unwrap_or_default();
+            if !formula_bar.is_invalid() && IsWindowVisible(formula_bar).as_bool() {
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(formula_bar, &mut rc);
+                let mut pt = POINT {
+                    x: rc.left,
+                    y: rc.top,
+                };
+                let _ = ScreenToClient(hwnd_top, &mut pt);
+                let h = rc.bottom - rc.top;
+                if pt.y > escala(40) && pt.y < escala(250) {
+                    return (pt.y + h).clamp(escala(60), escala(280));
+                }
+            }
+        }
+
+        // 1. Procurar DropShadow com pt.y > escala(40) e dentro dos limites da Ribbon
         let mut child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("DropShadow"), PCWSTR::null()) {
@@ -119,16 +323,19 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT { x: rc.left, y: rc.top };
+                let mut pt = POINT {
+                    x: rc.left,
+                    y: rc.top,
+                };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.y > 40 && pt.x == 0 {
-                    return pt.y + h; // Borda inferior do DropShadow
+                if pt.y > escala(40) && pt.y < escala(200) && pt.x == 0 {
+                    return (pt.y + h).clamp(escala(40), escala(220)); // Borda inferior do DropShadow
                 }
             }
         }
 
-        // 2. Procurar MsoCommandBarDock no topo (pt.x == 0, pt.y == 0, h > 40 e h < 500)
+        // 2. Procurar MsoCommandBarDock no topo com limites estritos da Ribbon
         child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("MsoCommandBarDock"), PCWSTR::null()) {
@@ -138,16 +345,19 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT { x: rc.left, y: rc.top };
+                let mut pt = POINT {
+                    x: rc.left,
+                    y: rc.top,
+                };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.x == 0 && pt.y <= 10 && h > 40 && h < 500 {
-                    return pt.y + h;
+                if pt.x == 0 && pt.y <= escala(15) && h > escala(35) && h < escala(210) {
+                    return (pt.y + h).clamp(escala(40), escala(220));
                 }
             }
         }
 
-        // 3. Procurar NetUIHWND no topo (pt.x == 0, pt.y == 0, h > 40 e h < 500)
+        // 3. Procurar NetUIHWND no topo com limites estritos da Ribbon
         child = HWND::default();
         loop {
             child = match FindWindowExW(hwnd_top, child, w!("NetUIHWND"), PCWSTR::null()) {
@@ -157,33 +367,34 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT { x: rc.left, y: rc.top };
+                let mut pt = POINT {
+                    x: rc.left,
+                    y: rc.top,
+                };
                 let _ = ScreenToClient(hwnd_top, &mut pt);
                 let h = rc.bottom - rc.top;
-                if pt.x == 0 && pt.y <= 10 && h > 40 && h < 500 {
-                    return pt.y + h;
+                if pt.x == 0 && pt.y <= escala(15) && h > escala(35) && h < escala(210) {
+                    return (pt.y + h).clamp(escala(40), escala(220));
                 }
             }
         }
 
-        // 4. Fallback pelo topo do documento se ainda não deslocado
-        let wwf = FindWindowExW(hwnd_top, HWND::default(), w!("_WwF"), PCWSTR::null()).unwrap_or_default();
-        let doc_view = if !wwf.is_invalid() {
-            wwf
-        } else {
-            FindWindowExW(hwnd_top, HWND::default(), w!("XLDESK"), PCWSTR::null()).unwrap_or_default()
-        };
-        if !doc_view.is_invalid() {
+        // 4. Fallback pelo topo da área de documento se ainda não deslocada
+        if let Some(doc_view) = localizar_area_documento(hwnd_top) {
             let mut rc = RECT::default();
             let _ = GetWindowRect(doc_view, &mut rc);
-            let mut pt = POINT { x: rc.left, y: rc.top };
+            let mut pt = POINT {
+                x: rc.left,
+                y: rc.top,
+            };
             let _ = ScreenToClient(hwnd_top, &mut pt);
-            if pt.y > 50 {
+            if pt.y > escala(45) && pt.y < escala(220) {
                 return pt.y;
             }
         }
 
-        178 // Padrão da fita moderna do Office (Office 2013-365)
+        // Fallback padrão ajustado para DPI (148px base em 96 DPI do Office moderno com Ribbon expandido)
+        escala(148)
     }
 }
 
@@ -191,10 +402,21 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
 // TabManager — opera SOMENTE na thread de UI
 // ---------------------------------------------------------------------------
 
+/// Identificadores de comandos do menu de contexto de abas
+pub const IDM_FECHAR: usize = 3001;
+pub const IDM_FECHAR_OUTRAS: usize = 3002;
+pub const IDM_FECHAR_DIREITA: usize = 3003;
+pub const IDM_COPIAR_CAMINHO: usize = 3004;
+pub const IDM_ABRIR_PASTA: usize = 3005;
+pub const IDM_NOVA_ABA: usize = 3006;
+pub const IDM_FECHAR_TODAS: usize = 3007;
+
 /// Gerenciador central de abas e janelas do Office.
 pub struct TabManager {
     subclass_manager: SubclassManager,
     estados: HashMap<isize, EstadoJanela>,
+    pub config: OfficeTabConfig,
+    ordem_documentos: Vec<HWND>,
 }
 
 unsafe impl Send for TabManager {}
@@ -202,10 +424,30 @@ unsafe impl Sync for TabManager {}
 
 impl TabManager {
     pub fn new() -> Self {
+        let config = crate::persistence::load_effective_config();
         Self {
             subclass_manager: SubclassManager::new(),
             estados: HashMap::new(),
+            config,
+            ordem_documentos: Vec::new(),
         }
+    }
+
+    /// Retorna a altura da barra de abas configurada escalonada pelo DPI da janela especificada.
+    pub fn obter_altura_barra(&self, hwnd: HWND) -> i32 {
+        let base = if self.config.general.tab_bar_height > 0 {
+            self.config.general.tab_bar_height
+        } else if self.config.theme.tab_height > 0 {
+            self.config.theme.tab_height
+        } else {
+            ALTURA_BARRA_ABAS
+        };
+        crate::tab_control::calcular_altura_por_dpi(hwnd, base)
+    }
+
+    /// Recarrega as configurações persistidas do registro (temas, posicionamento, etc.).
+    pub fn recarregar_configuracao(&mut self) {
+        self.config = crate::persistence::load_effective_config();
     }
 
     /// Descobre janelas visíveis das aplicações do Microsoft Office.
@@ -221,7 +463,10 @@ impl TabManager {
             return Ok(());
         }
 
-        log_debug(&format!("monitor_window (thread UI): HWND=0x{:X}", hwnd.0 as usize));
+        log_debug(&format!(
+            "monitor_window (thread UI): HWND=0x{:X}",
+            hwnd.0 as usize
+        ));
 
         // Assegurar WS_CLIPCHILDREN na janela moldura para não repintar sobre o TabControl
         unsafe {
@@ -240,22 +485,78 @@ impl TabManager {
                 y_base: 0,
                 doc_hwnds: Vec::new(),
                 titulos_cache: Vec::new(),
+                ult_largura: 0,
+                ult_altura: 0,
+                ult_y_ribbon: 0,
+                ult_y_doc: 0,
             },
         );
 
-        // Ativar timer periódico de atualização (400ms)
+        // Ativar timer periódico de atualização (800ms)
         unsafe {
-            let _ = SetTimer(hwnd, OFFICETAB_TIMER_ID, 400, None);
+            let _ = SetTimer(hwnd, OFFICETAB_TIMER_ID, 800, None);
         }
 
         // Sincronização inicial imediata
         let res = self.sincronizar_janela(hwnd);
-        log_debug(&format!("monitor_window: sincronizar res={:?}", res.is_ok()));
+        log_debug(&format!(
+            "monitor_window: sincronizar res={:?}",
+            res.is_ok()
+        ));
 
         res
     }
 
+    /// Alterna suavemente para a janela de documento selecionada no Modo de Janela Única.
+    /// Exibe e focaliza o documento de destino e oculta a janela anterior (SW_HIDE),
+    /// garantindo que apenas uma única janela do Word permaneça visível na tela
+    /// e na barra de tarefas do Windows (Single Window Mode / Single Taskbar Button).
+    pub fn alternar_para_janela(&self, hwnd_origem: HWND, hwnd_alvo: HWND) {
+        unsafe {
+            if IsIconic(hwnd_alvo).as_bool() {
+                let _ = ShowWindow(hwnd_alvo, SW_RESTORE);
+            }
+
+            if IsZoomed(hwnd_origem).as_bool() {
+                let _ = ShowWindow(hwnd_alvo, SW_MAXIMIZE);
+            } else {
+                let mut rc = RECT::default();
+                if GetWindowRect(hwnd_origem, &mut rc).is_ok() {
+                    let _ = SetWindowPos(
+                        hwnd_alvo,
+                        HWND::default(),
+                        rc.left,
+                        rc.top,
+                        rc.right - rc.left,
+                        rc.bottom - rc.top,
+                        SWP_NOZORDER,
+                    );
+                }
+            }
+            let _ = ShowWindow(hwnd_alvo, SW_SHOW);
+            let _ = BringWindowToTop(hwnd_alvo);
+            let _ = SetForegroundWindow(hwnd_alvo);
+
+            // Notifica formalmente o procedimento de janela da aplicação Office (especialmente
+            // vital no Excel para o subsistema MDI ativar a pasta de trabalho interna correspondente).
+            let _ = SendMessageW(hwnd_alvo, WM_ACTIVATE, WPARAM(1), LPARAM(0));
+
+            // MODO DE JANELA ÚNICA: Ocultar a janela anterior para que apenas
+            // uma única instância/janela do Word/Excel permaneça visível na tela e na barra de tarefas.
+            if hwnd_origem != hwnd_alvo && IsWindow(hwnd_origem).as_bool() {
+                let _ = ShowWindow(hwnd_origem, SW_HIDE);
+            }
+        }
+
+        log_debug(&format!(
+            "Alternado foco de HWND=0x{:X} para HWND=0x{:X} (Modo Janela Única)",
+            hwnd_origem.0 as usize,
+            hwnd_alvo.0 as usize
+        ));
+    }
+
     /// Sincroniza o controle visual de abas e redimensionamento.
+    /// Suporta os 7 aplicativos do Office (Word, Excel, PowerPoint, Access, Project, Visio, Publisher).
     /// DEVE ser chamado da thread de UI do Office.
     pub fn sincronizar_janela(&mut self, hwnd: HWND) -> Result<()> {
         unsafe {
@@ -274,34 +575,45 @@ impl TabManager {
                 return Ok(());
             }
 
+            // Verificar se a janela do Office está na tela inicial ou Backstage (Novo/Abrir/Opções)
+            if backstage_esta_aberto(hwnd) {
+                if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
+                    && let Some(ref tab) = estado.tab_control
+                {
+                    let _ = ShowWindow(tab.hwnd, SW_HIDE);
+                }
+                return Ok(());
+            }
+
+            // Documento em edição ativo: garantir que o controle de abas esteja visível
+            if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
+                && let Some(ref tab) = estado.tab_control
+                && !IsWindowVisible(tab.hwnd).as_bool()
+            {
+                let _ = ShowWindow(tab.hwnd, SW_SHOW);
+            }
+
+            // Obter altura da barra escalonada por DPI e configurações de fonte
+            let altura_barra = self.obter_altura_barra(hwnd);
+            let font_name = self.config.theme.font_name.clone();
+            let font_size = self.config.theme.font_size;
+
             let estado = match self.estados.get_mut(&(hwnd.0 as isize)) {
                 Some(e) => e,
                 None => return Ok(()),
             };
 
-            // Localizar janela interna de documento
-            let wwf = FindWindowExW(hwnd, HWND::default(), w!("_WwF"), PCWSTR::null())
-                .unwrap_or_default();
-            let xldesk = if wwf.is_invalid() {
-                FindWindowExW(hwnd, HWND::default(), w!("XLDESK"), PCWSTR::null())
-                    .unwrap_or_default()
-            } else {
-                HWND::default()
-            };
+            // Localizar janela interna de documento nos 7 aplicativos suportados
+            let doc_view = localizar_area_documento(hwnd);
+            estado.hwnd_doc_view = doc_view;
 
-            let doc_view = if !wwf.is_invalid() {
-                wwf
-            } else if !xldesk.is_invalid() {
-                xldesk
-            } else {
-                return Ok(());
-            };
-
-            estado.hwnd_doc_view = Some(doc_view);
-
-            // Calcular y_base DINAMICAMENTE para acompanhar ribbon recolhido/expandido
+            // Calcular y_base DINAMICAMENTE para acompanhar ribbon recolhido/expandido com DPI awareness
             let y_ribbon = calcular_y_ribbon(hwnd);
             estado.y_base = y_ribbon;
+
+            let layout_mudou = largura_cliente != estado.ult_largura
+                || altura_cliente != estado.ult_altura
+                || y_ribbon != estado.ult_y_ribbon;
 
             // Criar controle de abas se ainda não existir
             if estado.tab_control.is_none() {
@@ -311,45 +623,47 @@ impl TabManager {
                     0,
                     y_ribbon,
                     largura_cliente,
-                    ALTURA_BARRA_ABAS,
+                    altura_barra,
                 ) {
-                    Ok(tab) => {
+                    Ok(mut tab) => {
+                        tab.aplicar_fonte_tema(&font_name, font_size);
                         log_debug(&format!(
-                            "TabControl CRIADO (thread UI): HWND=0x{:X}, pai=0x{:X}, y={}",
-                            tab.hwnd.0 as usize,
-                            hwnd.0 as usize,
-                            y_ribbon
+                            "TabControl CRIADO (thread UI): HWND=0x{:X}, pai=0x{:X}, y={}, h={}",
+                            tab.hwnd.0 as usize, hwnd.0 as usize, y_ribbon, altura_barra
                         ));
                         estado.tab_control = Some(tab);
+                        estado.ult_largura = largura_cliente;
+                        estado.ult_altura = altura_cliente;
+                        estado.ult_y_ribbon = y_ribbon;
                     }
                     Err(e) => {
                         log_debug(&format!("ERRO AO CRIAR TabControl: {:?}", e));
                         return Err(e);
                     }
                 }
-            } else if let Some(ref tab) = estado.tab_control {
-                let _ = tab.resize(0, y_ribbon, largura_cliente, ALTURA_BARRA_ABAS);
-                let _ = SetWindowPos(
-                    tab.hwnd,
-                    HWND_TOP,
-                    0,
-                    y_ribbon,
-                    largura_cliente,
-                    ALTURA_BARRA_ABAS,
-                    SWP_SHOWWINDOW,
-                );
-                let _ = BringWindowToTop(tab.hwnd);
-                let _ = ShowWindow(tab.hwnd, SW_SHOW);
+            } else if layout_mudou && let Some(ref tab) = estado.tab_control {
+                let _ = tab.resize(0, y_ribbon, largura_cliente, altura_barra);
+                estado.ult_largura = largura_cliente;
+                estado.ult_altura = altura_cliente;
+                estado.ult_y_ribbon = y_ribbon;
             }
 
-            // Deslocar área do documento para baixo da barra de abas
-            if let Some(dv) = estado.hwnd_doc_view {
-                let y_doc = y_ribbon + ALTURA_BARRA_ABAS;
-                let h_doc = (altura_cliente - y_doc - 24).max(10);
-                let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+            // Deslocar área do documento para baixo da barra de abas apenas quando o layout mudar
+            if let Some(dv) = estado.hwnd_doc_view
+                && IsWindowVisible(dv).as_bool()
+            {
+                let y_doc = y_ribbon + altura_barra;
+                if layout_mudou || y_doc != estado.ult_y_doc {
+                    let h_doc = (altura_cliente - y_doc - 24).max(10);
+                    let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                    estado.ult_y_doc = y_doc;
+                }
             }
 
             // Popular abas com documentos abertos
+            // As janelas não ativas do Word ficam ocultas no modo de abas,
+            // mas continuam sendo documentos abertos e precisam permanecer
+            // representadas na barra.
             let mut docs_processo = listar_janelas_processo();
             if docs_processo.is_empty() {
                 let tit = extrair_texto_janela(hwnd);
@@ -361,14 +675,31 @@ impl TabManager {
                 docs_processo.push((hwnd, tit_limpo));
             }
 
-            let novos_titulos: Vec<String> =
-                docs_processo.iter().map(|(_, t)| t.clone()).collect();
+            // Preserva rigorosamente a posição estável das abas (não altera a ordem ao alternar foco):
+            let hwnds_atuais: Vec<HWND> = docs_processo.iter().map(|(h, _)| *h).collect();
+            self.ordem_documentos.retain(|h| hwnds_atuais.contains(h));
+
+            for &h in &hwnds_atuais {
+                if !self.ordem_documentos.contains(&h) {
+                    self.ordem_documentos.push(h);
+                }
+            }
+
+            let mut docs_estaveis: Vec<(HWND, String)> = Vec::new();
+            for &h in &self.ordem_documentos {
+                if let Some((_, tit)) = docs_processo.iter().find(|(dh, _)| *dh == h) {
+                    docs_estaveis.push((h, tit.clone()));
+                }
+            }
+
+            let novos_titulos: Vec<String> = docs_estaveis.iter().map(|(_, t)| t.clone()).collect();
+            let novos_hwnds: Vec<HWND> = docs_estaveis.iter().map(|(h, _)| *h).collect();
 
             if let Some(ref tab) = estado.tab_control {
-                if novos_titulos != estado.titulos_cache {
+                if novos_titulos != estado.titulos_cache || novos_hwnds != estado.doc_hwnds {
                     tab.clear_tabs();
 
-                    for (idx, (doc_hwnd, doc_titulo)) in docs_processo.iter().enumerate() {
+                    for (idx, (doc_hwnd, doc_titulo)) in docs_estaveis.iter().enumerate() {
                         let _ = tab.add_tab(idx as i32, doc_titulo);
                         if *doc_hwnd == hwnd {
                             let _ = tab.set_selected_tab(idx as i32);
@@ -376,15 +707,15 @@ impl TabManager {
                     }
 
                     // Aba "+" para novo documento
-                    let _ = tab.add_tab(docs_processo.len() as i32, "+");
+                    let _ = tab.add_tab(docs_estaveis.len() as i32, "+");
 
-                    estado.doc_hwnds = docs_processo.iter().map(|(h, _)| *h).collect();
+                    estado.doc_hwnds = novos_hwnds;
                     estado.titulos_cache = novos_titulos;
                     tab.repaint();
-                } else if let Some(pos) = estado.doc_hwnds.iter().position(|&h| h == hwnd) {
-                    if tab.get_selected_tab() != pos as i32 {
-                        let _ = tab.set_selected_tab(pos as i32);
-                    }
+                } else if let Some(pos) = estado.doc_hwnds.iter().position(|&h| h == hwnd)
+                    && tab.get_selected_tab() != pos as i32
+                {
+                    let _ = tab.set_selected_tab(pos as i32);
                     tab.repaint();
                 }
             }
@@ -394,57 +725,477 @@ impl TabManager {
     }
 
     /// Processa notificações do TabControl (clique em aba).
-    pub fn processar_notify(&mut self, hwnd: HWND, lparam: LPARAM) {
+    pub fn processar_notify(&mut self, hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
         if lparam.0 == 0 {
-            return;
+            return None;
         }
 
         let pnmhdr = unsafe { &*(lparam.0 as *const NMHDR) };
         if pnmhdr.idFrom != OFFICETAB_CONTROL_ID as usize || pnmhdr.code != TCN_SELCHANGE {
-            return;
+            if pnmhdr.idFrom == OFFICETAB_CONTROL_ID as usize && pnmhdr.code == NM_CUSTOMDRAW {
+                let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+                return self
+                    .processar_custom_draw(hwnd, draw)
+                    .map(|result| LRESULT(result as isize));
+            }
+
+            // Notificações de Tooltip (TTN_GETDISPINFOW / TTN_GETDISPINFOA)
+            const TTN_GETDISPINFOW: u32 = 0xFFFF_FDEE; // -530
+            const TTN_GETDISPINFOA: u32 = 0xFFFF_FDF8; // -520
+            if pnmhdr.code == TTN_GETDISPINFOW || pnmhdr.code == TTN_GETDISPINFOA {
+                return self.processar_tooltip_notify(hwnd, lparam);
+            }
+
+            return None;
         }
 
-        let (sel, total_docs, doc_hwnds) =
-            if let Some(estado) = self.estados.get(&(hwnd.0 as isize)) {
-                if let Some(ref tab) = estado.tab_control {
-                    (tab.get_selected_tab(), estado.doc_hwnds.len(), estado.doc_hwnds.clone())
-                } else {
-                    return;
-                }
-            } else {
-                return;
-            };
+        let estado = self.estados.get(&(hwnd.0 as isize))?;
+        let tab = estado.tab_control.as_ref()?;
+        let (sel, total_docs, doc_hwnds) = (
+            tab.get_selected_tab(),
+            estado.doc_hwnds.len(),
+            estado.doc_hwnds.clone(),
+        );
 
         if sel >= 0 && (sel as usize) < total_docs {
             let alvo = doc_hwnds[sel as usize];
             if alvo != hwnd {
-                unsafe {
-                    let _ = ShowWindow(alvo, SW_RESTORE);
-                    let _ = SetForegroundWindow(alvo);
-                    let _ = BringWindowToTop(alvo);
+                static ULTIMA_TROCA: Mutex<Option<(isize, std::time::Instant)>> = Mutex::new(None);
+                let agora = std::time::Instant::now();
+                if let Ok(mut lock) = ULTIMA_TROCA.lock() {
+                    if let Some((ult_alvo, ult_tempo)) = *lock
+                        && ult_alvo == alvo.0 as isize
+                        && agora.duration_since(ult_tempo).as_millis() < 250
+                    {
+                        return Some(LRESULT(0));
+                    }
+                    *lock = Some((alvo.0 as isize, agora));
                 }
+
+                let _ = self.monitor_window(alvo);
+                self.alternar_para_janela(hwnd, alvo);
+                let _ = self.sincronizar_janela(alvo);
             }
+            return Some(LRESULT(0));
         } else if (sel as usize) == total_docs {
             // Clicou na aba "+"
-            criar_novo_documento();
-            if let Some(estado) = self.estados.get(&(hwnd.0 as isize)) {
-                if let Some(ref tab) = estado.tab_control {
-                    if let Some(pos) = doc_hwnds.iter().position(|&h| h == hwnd) {
-                        let _ = tab.set_selected_tab(pos as i32);
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+            }
+            if let Some(estado) = self.estados.get(&(hwnd.0 as isize))
+                && let Some(ref tab) = estado.tab_control
+                && let Some(pos) = doc_hwnds.iter().position(|&h| h == hwnd)
+            {
+                let _ = tab.set_selected_tab(pos as i32);
+            }
+            return Some(LRESULT(0));
+        }
+        None
+    }
+
+    fn processar_custom_draw(&self, hwnd: HWND, draw: &NMCUSTOMDRAW) -> Option<u32> {
+        let estado = self.estados.get(&(hwnd.0 as isize))?;
+        let tab = estado.tab_control.as_ref()?;
+        if draw.hdr.hwndFrom != tab.hwnd {
+            return None;
+        }
+        let theme = self.tema_da_janela(hwnd);
+
+        if draw.dwDrawStage == CDDS_PREPAINT {
+            unsafe {
+                // Preenche o fundo da barra de abas
+                let brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(
+                    theme.bar_background,
+                )));
+                let _ = FillRect(draw.hdc, &draw.rc, brush);
+                let _ = DeleteObject(brush);
+
+                // Linha de base / divisor inferior contínuo em toda a barra (1px)
+                let border_color = COLORREF(crate::theme::Theme::to_colorref(theme.tab_border));
+                let border_brush = CreateSolidBrush(border_color);
+                let mut line_rc = draw.rc;
+                line_rc.top = line_rc.bottom - 1;
+                let _ = FillRect(draw.hdc, &line_rc, border_brush);
+                let _ = DeleteObject(border_brush);
+            }
+            return Some(CDRF_NOTIFYITEMDRAW);
+        }
+
+        if draw.dwDrawStage != CDDS_ITEMPREPAINT {
+            return None;
+        }
+
+        let tab_idx = draw.dwItemSpec;
+        let total_docs = estado.doc_hwnds.len();
+        let is_plus = tab_idx == total_docs;
+
+        let selected = (draw.uItemState.0 & CDIS_SELECTED.0) != 0;
+        let hot = (draw.uItemState.0 & CDIS_HOT.0) != 0;
+        let rc = draw.rc;
+
+        let accent_color = theme.custom_accent_color.unwrap_or(0x00185ABD);
+        let border_cr = COLORREF(crate::theme::Theme::to_colorref(theme.tab_border));
+
+        unsafe {
+            if is_plus {
+                // -----------------------------------------------------------
+                // Botão "+" (Novo Documento) com design moderno flutuante
+                // -----------------------------------------------------------
+                let btn_rc = RECT {
+                    left: rc.left + 3,
+                    top: rc.top + 3,
+                    right: rc.right - 3,
+                    bottom: rc.bottom - 2,
+                };
+
+                let bg_color = if hot {
+                    theme.hover_tab_bg
+                } else {
+                    theme.bar_background
+                };
+
+                let brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(bg_color)));
+                let _ = FillRect(draw.hdc, &btn_rc, brush);
+                let _ = DeleteObject(brush);
+
+                if hot {
+                    // Borda sutil de destaque ao passar o mouse
+                    let border_brush = CreateSolidBrush(border_cr);
+                    let mut b_top = btn_rc;
+                    b_top.bottom = b_top.top + 1;
+                    let _ = FillRect(draw.hdc, &b_top, border_brush);
+
+                    let mut b_bottom = btn_rc;
+                    b_bottom.top = b_bottom.bottom - 1;
+                    let _ = FillRect(draw.hdc, &b_bottom, border_brush);
+
+                    let mut b_left = btn_rc;
+                    b_left.right = b_left.left + 1;
+                    let _ = FillRect(draw.hdc, &b_left, border_brush);
+
+                    let mut b_right = btn_rc;
+                    b_right.left = b_right.right - 1;
+                    let _ = FillRect(draw.hdc, &b_right, border_brush);
+
+                    let _ = DeleteObject(border_brush);
+                }
+
+                let text_color = if hot {
+                    accent_color
+                } else {
+                    theme.inactive_tab_text
+                };
+
+                let _ = SetBkMode(draw.hdc, TRANSPARENT);
+                let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(text_color)));
+
+                let mut plus_str: [u16; 1] = [b'+' as u16];
+                let mut text_rc = btn_rc;
+                let _ = DrawTextW(
+                    draw.hdc,
+                    &mut plus_str,
+                    &mut text_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            } else {
+                // -----------------------------------------------------------
+                // Abas de Documentos (Design Premium Fluent / Modern Office)
+                // -----------------------------------------------------------
+                let bg_color = if selected {
+                    theme.active_tab_bg
+                } else if hot {
+                    theme.hover_tab_bg
+                } else {
+                    theme.inactive_tab_bg
+                };
+
+                let brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(bg_color)));
+                let _ = FillRect(draw.hdc, &rc, brush);
+                let _ = DeleteObject(brush);
+
+                if selected {
+                    // Indicador de destaque premium (Accent Bar de 3px no topo)
+                    let accent_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(accent_color)));
+                    let accent_rc = RECT {
+                        left: rc.left,
+                        top: rc.top,
+                        right: rc.right,
+                        bottom: rc.top + 3,
+                    };
+                    let _ = FillRect(draw.hdc, &accent_rc, accent_brush);
+                    let _ = DeleteObject(accent_brush);
+
+                    // Bordas laterais sutis (esquerda e direita)
+                    let border_brush = CreateSolidBrush(border_cr);
+                    let border_left = RECT {
+                        left: rc.left,
+                        top: rc.top + 3,
+                        right: rc.left + 1,
+                        bottom: rc.bottom,
+                    };
+                    let _ = FillRect(draw.hdc, &border_left, border_brush);
+
+                    let border_right = RECT {
+                        left: rc.right - 1,
+                        top: rc.top + 3,
+                        right: rc.right,
+                        bottom: rc.bottom,
+                    };
+                    let _ = FillRect(draw.hdc, &border_right, border_brush);
+                    let _ = DeleteObject(border_brush);
+
+                    // A base da aba ativa conecta perfeitamente ao documento
+                    let active_base_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(theme.active_tab_bg)));
+                    let base_rc = RECT {
+                        left: rc.left + 1,
+                        top: rc.bottom - 1,
+                        right: rc.right - 1,
+                        bottom: rc.bottom,
+                    };
+                    let _ = FillRect(draw.hdc, &base_rc, active_base_brush);
+                    let _ = DeleteObject(active_base_brush);
+                } else {
+                    // Aba inativa: divisor vertical sutil à direita para separar abas
+                    let div_brush = CreateSolidBrush(border_cr);
+                    let div_rc = RECT {
+                        left: rc.right - 1,
+                        top: rc.top + 5,
+                        right: rc.right,
+                        bottom: rc.bottom - 5,
+                    };
+                    let _ = FillRect(draw.hdc, &div_rc, div_brush);
+                    let _ = DeleteObject(div_brush);
+                }
+
+                // Título do Documento com ClearType e alinhamento impecável
+                let titulo = if tab_idx < estado.titulos_cache.len() {
+                    &estado.titulos_cache[tab_idx]
+                } else {
+                    "Documento"
+                };
+
+                let show_close = theme.show_close_button;
+                let text_right = if show_close { rc.right - 24 } else { rc.right - 8 };
+                let mut text_rc = RECT {
+                    left: rc.left + 12,
+                    top: rc.top,
+                    right: text_right.max(rc.left + 12),
+                    bottom: rc.bottom,
+                };
+
+                let text_color = if selected {
+                    theme.active_tab_text
+                } else if hot {
+                    theme.hover_tab_text
+                } else {
+                    theme.inactive_tab_text
+                };
+
+                let _ = SetBkMode(draw.hdc, TRANSPARENT);
+                let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(text_color)));
+
+                let mut utf16: Vec<u16> = titulo.encode_utf16().collect();
+                let _ = DrawTextW(
+                    draw.hdc,
+                    &mut utf16,
+                    &mut text_rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+
+                // Botão de fechar elegante ("×") com Fluent Close Button Hover
+                if show_close && (selected || hot) {
+                    let close_size = 14;
+                    let close_x = rc.right - close_size - 6;
+                    let close_y = rc.top + (rc.bottom - rc.top - close_size) / 2;
+                    let mut close_rc = RECT {
+                        left: close_x,
+                        top: close_y,
+                        right: close_x + close_size,
+                        bottom: close_y + close_size,
+                    };
+
+                    // Hit test no cursor do mouse para detecção de hover em tempo real
+                    let mut pt_cursor = POINT::default();
+                    let mut x_hover = false;
+                    if GetCursorPos(&mut pt_cursor).is_ok() {
+                        let _ = ScreenToClient(draw.hdr.hwndFrom, &mut pt_cursor);
+                        x_hover = pt_cursor.x >= (close_x - 3)
+                            && pt_cursor.x <= (close_x + close_size + 3)
+                            && pt_cursor.y >= (close_y - 3)
+                            && pt_cursor.y <= (close_y + close_size + 3);
                     }
+
+                    if x_hover {
+                        // Fluent Close Button Hover: badge suavemente avermelhado com cantos arredondados
+                        let bg_hover_rc = RECT {
+                            left: close_x - 2,
+                            top: close_y - 2,
+                            right: close_x + close_size + 2,
+                            bottom: close_y + close_size + 2,
+                        };
+                        let red_bg_brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(0x00FDE7E9)));
+                        let _ = FillRect(draw.hdc, &bg_hover_rc, red_bg_brush);
+                        let _ = DeleteObject(red_bg_brush);
+
+                        // Glyph '×' em vermelho carmesim Fluent vivo
+                        let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(0x00C42B1C)));
+                    } else {
+                        let close_color = if selected {
+                            0x00507A5E // Verde suave elegante harmonizado com o tom esverdeado da aba ativa
+                        } else {
+                            0x008A8886 // Cinza sutil para aba inativa
+                        };
+                        let _ = SetTextColor(draw.hdc, COLORREF(crate::theme::Theme::to_colorref(close_color)));
+                    }
+
+                    let mut x_glyph: [u16; 1] = [0x00D7]; // '×' (U+00D7)
+                    let _ = DrawTextW(
+                        draw.hdc,
+                        &mut x_glyph,
+                        &mut close_rc,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
                 }
             }
         }
+
+        Some(CDRF_SKIPDEFAULT)
     }
 
-    /// Trata a destruição de uma janela.
+    /// Processa requisições de Tooltip para abas exibindo o caminho completo do arquivo.
+    fn processar_tooltip_notify(&self, hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+        let estado = self.estados.get(&(hwnd.0 as isize))?;
+        let tab = estado.tab_control.as_ref()?;
+
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_ok() {
+                let _ = ScreenToClient(tab.hwnd, &mut pt);
+            }
+        }
+
+        #[repr(C)]
+        #[allow(non_snake_case, clippy::upper_case_acronyms)]
+        struct NMTTDISPINFOW {
+            hdr: NMHDR,
+            lpszText: *mut u16,
+            szText: [u16; 80],
+            hinst: windows::Win32::Foundation::HINSTANCE,
+            uFlags: u32,
+            lParam: LPARAM,
+        }
+
+        if let Some(idx) = tab.hit_test(pt.x, pt.y) {
+            let total_docs = estado.doc_hwnds.len();
+            if idx >= 0 && (idx as usize) < total_docs {
+                let titulo = if (idx as usize) < estado.titulos_cache.len() {
+                    &estado.titulos_cache[idx as usize]
+                } else {
+                    "Documento"
+                };
+
+                let tooltip_text = if let Some(caminho) = crate::utils::localizar_caminho_documento(titulo) {
+                    format!("{}\n{}", titulo, caminho.display())
+                } else {
+                    format!("{}\n[Documento Ativo]", titulo)
+                };
+
+                static TOOLTIP_BUFFER: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+                if let Ok(mut buf) = TOOLTIP_BUFFER.lock() {
+                    *buf = tooltip_text.encode_utf16().chain(std::iter::once(0)).collect();
+                    unsafe {
+                        let p_disp = &mut *(lparam.0 as *mut NMTTDISPINFOW);
+                        p_disp.lpszText = buf.as_mut_ptr();
+                    }
+                }
+                return Some(LRESULT(0));
+            } else if (idx as usize) == total_docs {
+                static TOOLTIP_NOVO: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+                if let Ok(mut buf) = TOOLTIP_NOVO.lock() {
+                    *buf = "Novo Documento (Ctrl+O / Ctrl+T)\0".encode_utf16().collect();
+                    unsafe {
+                        let p_disp = &mut *(lparam.0 as *mut NMTTDISPINFOW);
+                        p_disp.lpszText = buf.as_mut_ptr();
+                    }
+                }
+                return Some(LRESULT(0));
+            }
+        }
+        None
+    }
+
+    fn tema_da_janela(&self, hwnd: HWND) -> crate::theme::Theme {
+        let app_name = obter_tipo_app(&extrair_classe_janela(hwnd)).nome();
+        let app_opt = crate::theme::OfficeApp::from_name(app_name);
+
+        let mut theme = if self.config.general.adaptive_theme_by_app && let Some(app) = app_opt {
+            crate::theme::Theme::for_app(app)
+        } else {
+            self.config.theme.clone()
+        };
+
+        // Ao clicar nas abas elas ganham um tom esverdeado elegante e moderno:
+        theme.active_tab_bg = 0x00EBF5EF;             // Tom esverdeado suave (pastel sage / mint)
+        theme.active_tab_text = 0x000F5132;           // Verde floresta escuro de alta nitidez
+        theme.hover_tab_bg = 0x00F0FAF3;              // Hover sutilmente esverdeado
+        theme.tab_border = 0x00C4DFCE;                // Borda suave em harmonia
+        theme.custom_accent_color = Some(0x00107C41); // Accent Bar verde esmeralda no topo da aba ativa
+
+        theme
+    }
+
+    /// Trata a destruição de uma janela no Modo de Janela Única.
     pub fn processar_destroy(&mut self, hwnd: HWND) {
         unsafe {
             let _ = KillTimer(hwnd, OFFICETAB_TIMER_ID);
         }
-        if let Some(mut estado) = self.estados.remove(&(hwnd.0 as isize)) {
-            if let Some(ref mut tab) = estado.tab_control {
-                tab.destroy();
+        if let Some(mut estado) = self.estados.remove(&(hwnd.0 as isize))
+            && let Some(ref mut tab) = estado.tab_control
+        {
+            tab.destroy();
+        }
+
+        // Remover da lista ordenada de documentos
+        self.ordem_documentos.retain(|&h| h != hwnd);
+
+        // MODO DE JANELA ÚNICA:
+        // Se a janela destruída era a janela visível ativa, restaurar e exibir
+        // imediatamente a próxima janela restante da lista para que o Word
+        // permaneça visível na tela e na barra de tarefas!
+        let proxima_janela = self.ordem_documentos.first().copied().or_else(|| {
+            self.estados.keys().next().map(|&raw| HWND(raw as *mut _))
+        });
+
+        if let Some(hwnd_restante) = proxima_janela {
+            unsafe {
+                if IsWindow(hwnd_restante).as_bool() {
+                    let _ = ShowWindow(hwnd_restante, SW_SHOW);
+                    let _ = BringWindowToTop(hwnd_restante);
+                    let _ = SetForegroundWindow(hwnd_restante);
+                    let _ = PostMessageW(
+                        hwnd_restante,
+                        WM_OFFICETAB_RECARREGAR,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
+
+        // Notificar as demais janelas restantes para atualizar as abas imediatamente
+        for &raw_restante in self.estados.keys() {
+            let hwnd_restante = HWND(raw_restante as *mut _);
+            if Some(hwnd_restante) != proxima_janela {
+                unsafe {
+                    if IsWindow(hwnd_restante).as_bool() {
+                        let _ = PostMessageW(
+                            hwnd_restante,
+                            WM_OFFICETAB_RECARREGAR,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
             }
         }
     }
@@ -461,12 +1212,441 @@ impl TabManager {
             }
         }
         self.estados.clear();
+        self.ordem_documentos.clear();
         self.subclass_manager.unsubclass_all();
     }
 
     /// Retorna true se o HWND já está sendo monitorado.
     pub fn esta_monitorado(&self, hwnd: HWND) -> bool {
         self.estados.contains_key(&(hwnd.0 as isize))
+    }
+
+    /// Trata o clique do botão esquerdo do mouse sobre o controle de abas.
+    /// Retorna true se o clique ocorreu sobre o botão de fechar ('×') de uma aba,
+    /// interceptando a mensagem e fechando o documento diretamente.
+    pub fn tratar_lbutton_up(&mut self, hwnd_tab: HWND, x: i32, y: i32) -> bool {
+        for estado in self.estados.values_mut() {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                let total_docs = estado.doc_hwnds.len();
+                if let Some(tab_idx) = tab.hit_test(x, y)
+                    && tab_idx >= 0
+                    && (tab_idx as usize) < total_docs
+                {
+                    let mut rc_tab = RECT::default();
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            hwnd_tab,
+                            crate::tab_control::TCM_GETITEMRECT,
+                            WPARAM(tab_idx as usize),
+                            LPARAM(&mut rc_tab as *mut _ as isize),
+                        );
+                    }
+
+                    let close_size = 14;
+                    let close_x = rc_tab.right - close_size - 6;
+                    let close_y = rc_tab.top + (rc_tab.bottom - rc_tab.top - close_size) / 2;
+
+                    if x >= close_x - 4 && x <= close_x + close_size + 4 && y >= close_y - 4 && y <= close_y + close_size + 4 {
+                        let doc_fechar = estado.doc_hwnds[tab_idx as usize];
+                        let doc_origem = estado.hwnd;
+                        log_debug(&format!(
+                            "tratar_lbutton_up: fechando doc via clique no botão '×' da aba {} HWND=0x{:X}",
+                            tab_idx, doc_fechar.0 as usize
+                        ));
+                        if doc_fechar != doc_origem {
+                            self.alternar_para_janela(doc_origem, doc_fechar);
+                            let _ = self.sincronizar_janela(doc_fechar);
+                        }
+                        unsafe {
+                            let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+        false
+    }
+
+    /// Trata o clique com o botão do meio (mouse middle click) em uma aba para fechá-la.
+    pub fn tratar_mbutton_up(&mut self, hwnd_tab: HWND, x: i32, y: i32) {
+        for estado in self.estados.values_mut() {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                if let Some(tab_idx) = tab.hit_test(x, y) {
+                    let total_docs = estado.doc_hwnds.len();
+                    if tab_idx >= 0 && (tab_idx as usize) < total_docs {
+                        let doc_fechar = estado.doc_hwnds[tab_idx as usize];
+                        let doc_origem = estado.hwnd;
+                        log_debug(&format!(
+                            "tratar_mbutton_up: fechando doc na aba {} HWND=0x{:X}",
+                            tab_idx, doc_fechar.0 as usize
+                        ));
+                        if doc_fechar != doc_origem {
+                            self.alternar_para_janela(doc_origem, doc_fechar);
+                            let _ = self.sincronizar_janela(doc_fechar);
+                        }
+                        unsafe {
+                            let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Trata o clique duplo do mouse (Double Click) sobre o controle de abas.
+    /// Clique duplo na aba fecha o documento.
+    /// Clique duplo na barra vazia ou no botão '+' cria novo documento.
+    pub fn tratar_lbutton_dblclk(&mut self, hwnd_tab: HWND, x: i32, y: i32) {
+        for estado in self.estados.values_mut() {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                let total_docs = estado.doc_hwnds.len();
+                if let Some(tab_idx) = tab.hit_test(x, y) {
+                    if tab_idx >= 0 && (tab_idx as usize) < total_docs {
+                        let doc_fechar = estado.doc_hwnds[tab_idx as usize];
+                        let doc_origem = estado.hwnd;
+                        log_debug(&format!(
+                            "tratar_lbutton_dblclk: fechando doc via clique duplo na aba {} HWND=0x{:X}",
+                            tab_idx, doc_fechar.0 as usize
+                        ));
+                        if doc_fechar != doc_origem {
+                            self.alternar_para_janela(doc_origem, doc_fechar);
+                            let _ = self.sincronizar_janela(doc_fechar);
+                        }
+                        unsafe {
+                            let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    } else if (tab_idx as usize) == total_docs {
+                        log_debug("tratar_lbutton_dblclk: novo doc via clique duplo no '+'");
+                        unsafe {
+                            let _ = PostMessageW(estado.hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                } else {
+                    log_debug("tratar_lbutton_dblclk: novo doc via clique duplo na barra vazia");
+                    unsafe {
+                        let _ = PostMessageW(estado.hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Trata a rolagem da roda do mouse (Mouse Wheel) sobre a barra de abas, alternando para aba anterior ou seguinte.
+    pub fn tratar_mousewheel(&mut self, hwnd_tab: HWND, delta: i16) {
+        let mut transicao: Option<(HWND, HWND)> = None;
+        for estado in self.estados.values() {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                let total = estado.doc_hwnds.len();
+                if total > 1 {
+                    let cur = tab.get_selected_tab();
+                    let proximo = if delta > 0 {
+                        // Scroll para cima/frente: aba anterior
+                        if cur <= 0 { (total - 1) as i32 } else { cur - 1 }
+                    } else {
+                        // Scroll para baixo/trás: próxima aba
+                        if cur >= (total - 1) as i32 { 0 } else { cur + 1 }
+                    };
+                    if (proximo as usize) < total {
+                        let alvo = estado.doc_hwnds[proximo as usize];
+                        if alvo != estado.hwnd {
+                            transicao = Some((estado.hwnd, alvo));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if let Some((origem, alvo)) = transicao {
+            self.alternar_para_janela(origem, alvo);
+            let _ = self.sincronizar_janela(alvo);
+        }
+    }
+
+    /// Trata atalhos de teclado do OfficeTab:
+    /// - Ctrl+Tab: Próxima aba
+    /// - Ctrl+Shift+Tab: Aba anterior
+    /// - Ctrl+W / Ctrl+F4: Fechar documento atual
+    /// - Ctrl+T: Nova aba / documento
+    pub fn tratar_keydown(&mut self, hwnd: HWND, vk: usize) -> bool {
+        let ctrl_pressionado = unsafe {
+            (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+        };
+        if !ctrl_pressionado {
+            return false;
+        }
+        let shift_pressionado = unsafe {
+            (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32,
+            ) as u16 & 0x8000) != 0
+        };
+
+        let (total, cur, doc_hwnds) = match self.estados.get(&(hwnd.0 as isize)) {
+            Some(e) => (
+                e.doc_hwnds.len(),
+                e.tab_control.as_ref().map(|t| t.get_selected_tab()).unwrap_or(0),
+                e.doc_hwnds.clone(),
+            ),
+            None => return false,
+        };
+
+        if total == 0 {
+            return false;
+        }
+
+        // VK_TAB = 0x09
+        if vk == 0x09 {
+            let proximo = if shift_pressionado {
+                if cur <= 0 { (total - 1) as i32 } else { cur - 1 }
+            } else {
+                if cur >= (total - 1) as i32 { 0 } else { cur + 1 }
+            };
+            if (proximo as usize) < total {
+                let alvo = doc_hwnds[proximo as usize];
+                if alvo != hwnd {
+                    self.alternar_para_janela(hwnd, alvo);
+                    let _ = self.sincronizar_janela(alvo);
+                }
+                return true;
+            }
+        } else if vk == b'W' as usize || vk == 0x73 /* VK_F4 */ {
+            // Ctrl+W ou Ctrl+F4: fechar documento atual
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            return true;
+        } else if vk == b'T' as usize {
+            // No Excel, Ctrl+T é o atalho nativo universal para "Criar Tabela" (Create Table).
+            // Para não quebrar o fluxo de trabalho do usuário no Excel, não interceptamos Ctrl+T no Excel,
+            // permitindo que o usuário use o botão '+' da barra ou Ctrl+O/Ctrl+N nativos.
+            let classe = extrair_classe_janela(hwnd);
+            if obter_tipo_app(&classe) != TipoAppOffice::Excel {
+                // Ctrl+T: nova aba / novo documento nos demais aplicativos Office
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Trata o clique com o botão direito do mouse exibindo menu de contexto.
+    pub fn tratar_rbutton_up(&mut self, hwnd_tab: HWND, x: i32, y: i32) {
+        let mut pt_screen = POINT { x, y };
+        unsafe {
+            let _ = ClientToScreen(hwnd_tab, &mut pt_screen);
+        }
+        self.abrir_menu_contexto(hwnd_tab, pt_screen, Some(POINT { x, y }));
+    }
+
+    /// Trata WM_CONTEXTMENU disparado via coordenadas de tela.
+    pub fn tratar_context_menu(&mut self, hwnd_tab: HWND, screen_x: i32, screen_y: i32) {
+        let pt_screen = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        let mut pt_client = pt_screen;
+        unsafe {
+            let _ = ScreenToClient(hwnd_tab, &mut pt_client);
+        }
+        self.abrir_menu_contexto(hwnd_tab, pt_screen, Some(pt_client));
+    }
+
+    /// Trata menu de contexto acionado via teclado (tecla Menu ou Shift+F10).
+    pub fn tratar_context_menu_teclado(&mut self, hwnd_tab: HWND) {
+        let mut pt_screen = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt_screen);
+        }
+        self.abrir_menu_contexto(hwnd_tab, pt_screen, None);
+    }
+
+    /// Constrói e exibe o menu de contexto moderno para a aba ou barra de abas.
+    fn abrir_menu_contexto(&mut self, hwnd_tab: HWND, pt_screen: POINT, pt_client: Option<POINT>) {
+        for estado in self.estados.values_mut() {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                let total_docs = estado.doc_hwnds.len();
+                let tab_idx = match pt_client {
+                    Some(pt) => tab.hit_test(pt.x, pt.y),
+                    None => {
+                        let sel = tab.get_selected_tab();
+                        if sel >= 0 { Some(sel) } else { None }
+                    }
+                };
+
+                unsafe {
+                    let hmenu = match CreatePopupMenu() {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+
+                    if let Some(idx) = tab_idx
+                        && (idx as usize) < total_docs
+                    {
+                        // Clicou sobre uma aba de documento válida
+                        let _ =
+                            AppendMenuW(hmenu, MF_STRING, IDM_FECHAR, w!("&Fechar Aba\tCtrl+W"));
+                        let _ = AppendMenuW(
+                            hmenu,
+                            MF_STRING,
+                            IDM_FECHAR_OUTRAS,
+                            w!("Fechar &Outras Abas"),
+                        );
+                        if (idx as usize) + 1 < total_docs {
+                            let _ = AppendMenuW(
+                                hmenu,
+                                MF_STRING,
+                                IDM_FECHAR_DIREITA,
+                                w!("Fechar Abas à &Direita"),
+                            );
+                        }
+                        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                        let _ = AppendMenuW(
+                            hmenu,
+                            MF_STRING,
+                            IDM_COPIAR_CAMINHO,
+                            w!("&Copiar Caminho do Arquivo"),
+                        );
+                        let _ = AppendMenuW(
+                            hmenu,
+                            MF_STRING,
+                            IDM_ABRIR_PASTA,
+                            w!("&Abrir Pasta do Arquivo"),
+                        );
+                        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                        let _ =
+                            AppendMenuW(hmenu, MF_STRING, IDM_NOVA_ABA, w!("&Nova Aba\tCtrl+N"));
+                    } else {
+                        // Clicou na área vazia da barra ou na aba "+"
+                        let _ =
+                            AppendMenuW(hmenu, MF_STRING, IDM_NOVA_ABA, w!("&Nova Aba\tCtrl+N"));
+                        if total_docs > 0 {
+                            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                            let _ = AppendMenuW(
+                                hmenu,
+                                MF_STRING,
+                                IDM_FECHAR_TODAS,
+                                w!("Fechar &Todas as Abas"),
+                            );
+                        }
+                    }
+
+                    let cmd = TrackPopupMenu(
+                        hmenu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        pt_screen.x,
+                        pt_screen.y,
+                        0,
+                        hwnd_tab,
+                        None,
+                    );
+                    let _ = DestroyMenu(hmenu);
+
+                    let cmd_val = cmd.0 as usize;
+                    match cmd_val {
+                        IDM_FECHAR => {
+                            if let Some(idx) = tab_idx
+                                && (idx as usize) < total_docs
+                            {
+                                let doc = estado.doc_hwnds[idx as usize];
+                                let doc_origem = estado.hwnd;
+                                if doc != doc_origem {
+                                    self.alternar_para_janela(doc_origem, doc);
+                                    let _ = self.sincronizar_janela(doc);
+                                }
+                                let _ = PostMessageW(doc, WM_CLOSE, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                        IDM_FECHAR_OUTRAS => {
+                            if let Some(idx) = tab_idx
+                                && (idx as usize) < total_docs
+                            {
+                                let manter = estado.doc_hwnds[idx as usize];
+                                for &doc in &estado.doc_hwnds {
+                                    if doc != manter {
+                                        let _ = PostMessageW(doc, WM_CLOSE, WPARAM(0), LPARAM(0));
+                                    }
+                                }
+                            }
+                        }
+                        IDM_FECHAR_DIREITA => {
+                            if let Some(idx) = tab_idx
+                                && (idx as usize) < total_docs
+                            {
+                                for &doc in estado.doc_hwnds.iter().skip((idx as usize) + 1) {
+                                    let _ = PostMessageW(doc, WM_CLOSE, WPARAM(0), LPARAM(0));
+                                }
+                            }
+                        }
+                        IDM_COPIAR_CAMINHO => {
+                            if let Some(idx) = tab_idx
+                                && (idx as usize) < estado.titulos_cache.len()
+                            {
+                                let titulo = &estado.titulos_cache[idx as usize];
+                                let texto_copiar = if let Some(caminho) =
+                                    crate::utils::localizar_caminho_documento(titulo)
+                                {
+                                    caminho.display().to_string()
+                                } else {
+                                    titulo.clone()
+                                };
+                                let _ = crate::utils::copiar_para_clipboard(&texto_copiar);
+                                log_debug(&format!(
+                                    "Caminho/título copiado para clipboard: {}",
+                                    texto_copiar
+                                ));
+                            }
+                        }
+                        IDM_ABRIR_PASTA => {
+                            if let Some(idx) = tab_idx
+                                && (idx as usize) < estado.titulos_cache.len()
+                            {
+                                let titulo = &estado.titulos_cache[idx as usize];
+                                if let Some(caminho) =
+                                    crate::utils::localizar_caminho_documento(titulo)
+                                {
+                                    let _ = crate::utils::abrir_pasta_no_explorer(&caminho);
+                                } else {
+                                    let doc_dir = crate::utils::obter_pasta_documentos_usuario();
+                                    let _ = crate::utils::abrir_pasta_no_explorer(&doc_dir);
+                                }
+                            }
+                        }
+                        IDM_NOVA_ABA => {
+                            let _ = PostMessageW(
+                                estado.hwnd,
+                                WM_OFFICETAB_NOVO_DOC,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                        IDM_FECHAR_TODAS => {
+                            for &doc in &estado.doc_hwnds {
+                                let _ = PostMessageW(doc, WM_CLOSE, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -492,36 +1672,42 @@ static MONITORAMENTO_ATIVO: AtomicBool = AtomicBool::new(false);
 static WINEVENT_HOOK: Mutex<Option<isize>> = Mutex::new(None);
 static TIMER_UI_ID: Mutex<Option<usize>> = Mutex::new(None);
 
-/// Callback periódico executado DIRETAMENTE NA THREAD DE UI do Office via SetTimer.
-/// Garante que novas janelas de documentos visíveis sejam imediatamente subclassed e sincronizadas.
-unsafe extern "system" fn timer_ui_callback(
-    _hwnd: HWND,
-    _msg: u32,
-    _id: usize,
-    _time: u32,
-) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if guard.is_none() {
-            *guard = Some(TabManager::new());
-        }
-        if let Some(ref mut manager) = *guard {
-            let janelas = listar_janelas_processo();
-            for (h, _) in janelas {
-                if !manager.esta_monitorado(h) {
-                    log_debug(&format!(
-                        "timer_ui_callback: nova janela Office detectada HWND=0x{:X}",
-                        h.0 as usize
-                    ));
-                    let _ = manager.monitor_window(h);
-                } else {
-                    let _ = manager.sincronizar_janela(h);
+/// Informa se o gerenciador global de abas pode ser descarregado da memória sem risco de crash.
+/// Utilizado diretamente por DllCanUnloadNow para garantir cleanup limpo e encerramento das threads.
+pub fn pode_descarregar() -> bool {
+    if MONITORAMENTO_ATIVO.load(Ordering::Acquire) {
+        return false;
+    }
+    if let Ok(guard) = GLOBAL_TAB_MANAGER.lock()
+        && let Some(ref manager) = *guard
+    {
+        return manager.estados.is_empty();
+    }
+    true
+}
+
+/// Verifica janelas periodicamente no loop da thread Office que inicializou o add-in.
+/// O hook é o caminho principal; este timer cobre hooks indisponíveis e eventos perdidos.
+unsafe extern "system" fn timer_ui_callback(_hwnd: HWND, _msg: u32, _id: usize, _time: u32) {
+    if !MONITORAMENTO_ATIVO.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let janelas = listar_janelas_processo();
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            for (hwnd, _) in janelas {
+                if !manager.esta_monitorado(hwnd) {
+                    let _ = manager.monitor_window(hwnd);
                 }
             }
         }
-    }
+    }));
 }
 
 /// Callback do WinEventHook — executado na thread de UI do processo que gerou o evento.
+/// Blindado com catch_unwind para proteger a integridade do processo do Office.
 unsafe extern "system" fn winevent_callback(
     _hook: HWINEVENTHOOK,
     _event: u32,
@@ -531,37 +1717,29 @@ unsafe extern "system" fn winevent_callback(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if id_object != 0 || hwnd.is_invalid() {
-        return;
-    }
-
-    unsafe {
-        if !IsWindowVisible(hwnd).as_bool() {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if id_object != 0 || hwnd.is_invalid() {
             return;
         }
-    }
 
-    let classe = extrair_classe_janela(hwnd);
-    let e_office = classe == "OpusApp" || classe == "XLMAIN" || classe == "PPTFrameClass";
-    if !e_office {
-        return;
-    }
-
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if guard.is_none() {
-            *guard = Some(TabManager::new());
-        }
-        if let Some(ref mut manager) = *guard {
-            if !manager.esta_monitorado(hwnd) {
-                log_debug(&format!(
-                    "WinEventHook: janela Office detectada HWND=0x{:X} classe={}",
-                    hwnd.0 as usize,
-                    classe
-                ));
-                let _ = manager.monitor_window(hwnd);
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() {
+                return;
             }
         }
-    }
+
+        let classe = extrair_classe_janela(hwnd);
+        let tipo_app = obter_tipo_app(&classe);
+        if !tipo_app.e_office() {
+            return;
+        }
+
+        // Posta WM_OFFICETAB_INICIALIZAR de forma assíncrona para que a janela seja anexada
+        // no loop de mensagens normal da UI, garantindo ZERO risco de deadlock de reentrância!
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_OFFICETAB_INICIALIZAR, WPARAM(0), LPARAM(0));
+        }
+    }));
 }
 
 /// Instala WinEventHook para detectar novas janelas Office no processo atual.
@@ -572,8 +1750,10 @@ fn instalar_winevent_hook() -> bool {
     }
 
     unsafe {
+        // Intercepta eventos desde a criação (EVENT_OBJECT_CREATE = 0x8000) até a exibição (EVENT_OBJECT_SHOW = 0x8002)
+        // para capturar instantaneamente novas janelas e pastas de trabalho do Office (Word, Excel, etc.).
         let hook = SetWinEventHook(
-            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_CREATE,
             EVENT_OBJECT_SHOW,
             windows::Win32::Foundation::HMODULE::default(),
             Some(winevent_callback),
@@ -583,7 +1763,10 @@ fn instalar_winevent_hook() -> bool {
         );
 
         if !hook.is_invalid() {
-            log_debug(&format!("WinEventHook instalado: handle=0x{:x}", hook.0 as usize));
+            log_debug(&format!(
+                "WinEventHook instalado: handle=0x{:x}",
+                hook.0 as usize
+            ));
             *guard = Some(hook.0 as usize as isize);
             true
         } else {
@@ -603,69 +1786,28 @@ fn desinstalar_winevent_hook() {
     }
 }
 
-/// Thread de monitoramento fallback para segurança redundante
-fn iniciar_thread_monitoramento_fallback() {
-    if MONITORAMENTO_ATIVO.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    std::thread::spawn(move || {
-        log_debug("Thread de monitoramento REA (fallback) iniciada");
-        let mut ja_postados: std::collections::HashSet<isize> = std::collections::HashSet::new();
-
-        while MONITORAMENTO_ATIVO.load(Ordering::Relaxed) {
-            let janelas = listar_janelas_processo();
-            let hwnds_atuais: std::collections::HashSet<isize> =
-                janelas.iter().map(|(h, _)| h.0 as isize).collect();
-
-            ja_postados.retain(|raw| hwnds_atuais.contains(raw));
-
-            for (hwnd, _) in &janelas {
-                let raw = hwnd.0 as isize;
-                if !ja_postados.contains(&raw) {
-                    unsafe {
-                        let ok = PostMessageW(
-                            *hwnd,
-                            WM_OFFICETAB_INICIALIZAR,
-                            windows::Win32::Foundation::WPARAM(0),
-                            windows::Win32::Foundation::LPARAM(0),
-                        );
-                        if ok.is_ok() {
-                            ja_postados.insert(raw);
-                            log_debug(&format!(
-                                "REA fallback: PostMessage INICIALIZAR → HWND=0x{:X}",
-                                hwnd.0 as usize
-                            ));
-                        }
-                    }
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-
-        log_debug("Thread de monitoramento REA (fallback) encerrada");
-    });
-}
-
-/// Varre janelas Office já existentes e inicia monitoramento.
+/// Anexa janelas já abertas diretamente na thread UI que recebeu OnConnection.
 fn varrer_janelas_existentes() {
     let janelas = listar_janelas_processo();
     if janelas.is_empty() {
         return;
     }
 
-    log_debug(&format!("Varrendo {} janelas Office já abertas...", janelas.len()));
+    log_debug(&format!(
+        "Varrendo {} janelas Office já abertas...",
+        janelas.len()
+    ));
 
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if guard.is_none() {
-            *guard = Some(TabManager::new());
-        }
-        if let Some(ref mut manager) = *guard {
-            for (hwnd, _) in &janelas {
-                if !manager.esta_monitorado(*hwnd) {
-                    let _ = manager.monitor_window(*hwnd);
-                }
+    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
+        && let Some(ref mut manager) = *guard
+    {
+        for (hwnd, _) in janelas {
+            if !manager.esta_monitorado(hwnd)
+                && let Err(error) = manager.monitor_window(hwnd)
+            {
+                log_debug(&format!(
+                    "Falha ao anexar janela inicial {hwnd:?}: {error:?}"
+                ));
             }
         }
     }
@@ -673,21 +1815,24 @@ fn varrer_janelas_existentes() {
 
 /// Inicia o monitoramento completo do Office Tab
 pub fn iniciar_thread_monitoramento() {
+    if MONITORAMENTO_ATIVO.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let _ = instalar_winevent_hook();
 
-    // Instalar timer na thread de UI (mensagens disparadas no loop principal do Word)
+    // Mantém o timer de verificação periódico (1000ms) na thread de UI ativa como rede de proteção,
+    // garantindo que qualquer janela secundária de pasta de trabalho criada assincronamente pelo Excel
+    // seja monitorada e receba a barra de abas mesmo antes de qualquer interação do usuário.
     unsafe {
         let mut guard = TIMER_UI_ID.lock().unwrap();
         if guard.is_none() {
-            let tid = SetTimer(HWND::default(), 0, 350, Some(timer_ui_callback));
+            let tid = SetTimer(HWND::default(), 0, 1000, Some(timer_ui_callback));
             if tid != 0 {
                 *guard = Some(tid);
-                log_debug(&format!("Timer de UI instalado: id={}", tid));
             }
         }
     }
 
-    iniciar_thread_monitoramento_fallback();
     varrer_janelas_existentes();
 }
 
@@ -704,72 +1849,228 @@ pub fn obter_ou_criar_gerenciador() {
 // Despacho de eventos de janela (thread de UI do Office)
 // ---------------------------------------------------------------------------
 
-/// Chamado via WM_TIMER.
+/// Chamado via WM_TIMER. Blindado com catch_unwind.
 pub fn despachar_timer(hwnd: HWND) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if let Some(ref mut manager) = *guard {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
             let _ = manager.sincronizar_janela(hwnd);
         }
-    }
+    }));
 }
 
-/// Chamado via WM_SIZE.
+/// Chamado via WM_SIZE. Blindado com catch_unwind.
 pub fn despachar_size(hwnd: HWND) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if let Some(ref mut manager) = *guard {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
             let _ = manager.sincronizar_janela(hwnd);
         }
-    }
+    }));
 }
 
-/// Chamado via WM_NOTIFY.
-pub fn despachar_notify(hwnd: HWND, lparam: LPARAM) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if let Some(ref mut manager) = *guard {
-            manager.processar_notify(hwnd, lparam);
+/// Chamado via WM_NOTIFY. Blindado com catch_unwind.
+pub fn despachar_notify(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            return manager.processar_notify(hwnd, lparam);
         }
-    }
+        None
+    }))
+    .unwrap_or(None)
 }
 
-/// Chamado via WM_DESTROY/WM_NCDESTROY.
+/// Chamado via WM_DESTROY/WM_NCDESTROY. Blindado com catch_unwind.
 pub fn despachar_destroy(hwnd: HWND) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if let Some(ref mut manager) = *guard {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
+            && let Some(ref mut manager) = *guard
+        {
             manager.processar_destroy(hwnd);
         }
-    }
+    }));
 }
 
-/// Chamado via WM_OFFICETAB_INICIALIZAR.
+/// Chamado via WM_OFFICETAB_INICIALIZAR. Blindado com catch_unwind.
 pub fn despachar_inicializar(hwnd: HWND) {
-    log_debug(&format!("despachar_inicializar (thread UI): HWND=0x{:X}", hwnd.0 as usize));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log_debug(&format!(
+            "despachar_inicializar (thread UI): HWND=0x{:X}",
+            hwnd.0 as usize
+        ));
 
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if guard.is_none() {
-            *guard = Some(TabManager::new());
-        }
-        if let Some(ref mut manager) = *guard {
-            if !manager.esta_monitorado(hwnd) {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
+            if guard.is_none() {
+                *guard = Some(TabManager::new());
+            }
+            if let Some(ref mut manager) = *guard
+                && !manager.esta_monitorado(hwnd)
+            {
+                if let Some((&raw_existente, _)) = manager.estados.iter().find(|(raw, _)| **raw != (hwnd.0 as isize)) {
+                    let hwnd_existente = HWND(raw_existente as *mut _);
+                    unsafe {
+                        if IsWindow(hwnd_existente).as_bool() {
+                            if IsZoomed(hwnd_existente).as_bool() {
+                                let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                            } else {
+                                let mut rc = RECT::default();
+                                if GetWindowRect(hwnd_existente, &mut rc).is_ok() {
+                                    let _ = SetWindowPos(
+                                        hwnd,
+                                        HWND::default(),
+                                        rc.left,
+                                        rc.top,
+                                        rc.right - rc.left,
+                                        rc.bottom - rc.top,
+                                        SWP_NOZORDER,
+                                    );
+                                }
+                            }
+                            // MODO DE JANELA ÚNICA: Oculta a janela anterior para que apenas
+                            // a nova janela ativa do Word permaneça visível na tela e na barra de tarefas.
+                            let _ = ShowWindow(hwnd_existente, SW_HIDE);
+                        }
+                    }
+                }
+
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = BringWindowToTop(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+
                 let res = manager.monitor_window(hwnd);
                 log_debug(&format!(
                     "despachar_inicializar: monitor_window res={}",
                     res.is_ok()
                 ));
+
+                for &raw_existente in manager.estados.keys() {
+                    let hwnd_existente = HWND(raw_existente as *mut _);
+                    if hwnd_existente != hwnd {
+                        unsafe {
+                            let _ = PostMessageW(
+                                hwnd_existente,
+                                WM_OFFICETAB_RECARREGAR,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                }
             }
         }
-    }
+    }));
 }
 
-/// Chamado via WM_OFFICETAB_RECARREGAR.
+/// Chamado via WM_OFFICETAB_RECARREGAR. Blindado com catch_unwind.
 pub fn despachar_recarregar(hwnd: HWND) {
-    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock() {
-        if let Some(ref mut manager) = *guard {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
             if let Some(estado) = manager.estados.get_mut(&(hwnd.0 as isize)) {
                 estado.titulos_cache.clear();
             }
             let _ = manager.sincronizar_janela(hwnd);
         }
-    }
+    }));
+}
+
+/// Chamado quando o botão esquerdo do mouse é solto sobre o controle de abas (SysTabControl32). Blindado com catch_unwind.
+pub fn despachar_tab_lbutton_up(hwnd_tab: HWND, x: i32, y: i32) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            return manager.tratar_lbutton_up(hwnd_tab, x, y);
+        }
+        false
+    }))
+    .unwrap_or(false)
+}
+
+/// Chamado quando o botão do meio do mouse é clicado sobre o controle de abas (SysTabControl32). Blindado com catch_unwind.
+pub fn despachar_tab_mbutton_up(hwnd_tab: HWND, x: i32, y: i32) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_mbutton_up(hwnd_tab, x, y);
+        }
+    }));
+}
+
+/// Chamado quando o botão direito do mouse é clicado sobre o controle de abas (SysTabControl32). Blindado com catch_unwind.
+pub fn despachar_tab_rbutton_up(hwnd_tab: HWND, x: i32, y: i32) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_rbutton_up(hwnd_tab, x, y);
+        }
+    }));
+}
+
+/// Chamado quando o menu de contexto é acionado sobre o controle de abas via coordenadas de tela. Blindado com catch_unwind.
+pub fn despachar_tab_context_menu(hwnd_tab: HWND, screen_x: i32, screen_y: i32) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_context_menu(hwnd_tab, screen_x, screen_y);
+        }
+    }));
+}
+
+/// Chamado quando o menu de contexto é acionado sobre o controle de abas via atalho de teclado. Blindado com catch_unwind.
+pub fn despachar_tab_context_menu_teclado(hwnd_tab: HWND) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_context_menu_teclado(hwnd_tab);
+        }
+    }));
+}
+
+/// Chamado quando ocorre duplo clique sobre o controle de abas (SysTabControl32). Blindado com catch_unwind.
+pub fn despachar_tab_lbutton_dblclk(hwnd_tab: HWND, x: i32, y: i32) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_lbutton_dblclk(hwnd_tab, x, y);
+        }
+    }));
+}
+
+/// Chamado quando a roda do mouse é girada sobre o controle de abas. Blindado com catch_unwind.
+pub fn despachar_tab_mousewheel(hwnd_tab: HWND, delta: i16) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.tratar_mousewheel(hwnd_tab, delta);
+        }
+    }));
+}
+
+/// Chamado em WM_KEYDOWN na janela monitorada do Office para interceptar atalhos (Ctrl+Tab, Ctrl+W, Ctrl+T).
+pub fn despachar_keydown(hwnd: HWND, vk: usize) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            return manager.tratar_keydown(hwnd, vk);
+        }
+        false
+    }))
+    .unwrap_or(false)
 }
 
 /// Varre e anexa o gerenciamento às janelas ativas do Office.
@@ -787,6 +2088,7 @@ pub fn varrer_e_anexar_janelas() {
     }
 }
 
+/// Desativa completamente o gerenciamento global de abas, desconecta hooks e encerra threads.
 pub fn desativar_gerenciador_global() {
     MONITORAMENTO_ATIVO.store(false, Ordering::SeqCst);
     desinstalar_winevent_hook();
@@ -803,6 +2105,7 @@ pub fn desativar_gerenciador_global() {
         if let Some(ref mut manager) = *guard {
             manager.cleanup();
         }
+        *guard = None;
     }
 }
 
@@ -810,11 +2113,38 @@ pub fn desativar_gerenciador_global() {
 // Funções Auxiliares Win32
 // ---------------------------------------------------------------------------
 
-fn criar_novo_documento() {
+/// Chamado via WM_OFFICETAB_NOVO_DOC. Blindado com catch_unwind.
+pub fn despachar_novo_doc(hwnd: HWND) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        criar_novo_documento(hwnd);
+    }));
+}
+
+fn criar_novo_documento(hwnd: HWND) {
+    log_debug(&format!("criar_novo_documento chamado para HWND=0x{:X}", hwnd.0 as usize));
+
+    // 1. Tentar criar via COM IDispatch (método oficial e confiável em qualquer idioma do Office)
+    if crate::com_addin_simple::criar_documento_com() {
+        log_debug("Documento criado nativamente via COM IDispatch com sucesso");
+        return;
+    }
+
+    // 2. Fallback via teclado/mensagens Win32
+    log_debug("COM indisponível; tentando atalhos de teclado (Ctrl+O / Ctrl+N)");
     unsafe {
+        if !hwnd.is_invalid() {
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+            let area_doc = localizar_area_documento(hwnd);
+            let foco_alvo = area_doc.unwrap_or(hwnd);
+            let _ = SetFocus(foco_alvo);
+        }
+
+        // No Word em Português: Ctrl+O cria Novo Documento (Ctrl+N ativa Negrito!)
+        // No Word em Inglês: Ctrl+N cria Novo Documento
         keybd_event(VK_CONTROL.0 as u8, 0, Default::default(), 0);
-        keybd_event(b'N', 0, Default::default(), 0);
-        keybd_event(b'N', 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(b'O', 0, Default::default(), 0);
+        keybd_event(b'O', 0, KEYEVENTF_KEYUP, 0);
         keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
     }
 }
@@ -845,14 +2175,47 @@ pub fn extrair_texto_janela(hwnd: HWND) -> String {
     }
 }
 
-/// Limpa sufixos padrão do Office do título da janela.
-fn limpar_titulo_documento(titulo: &str) -> String {
-    let limpo = titulo
-        .trim_end_matches(" - Word")
-        .trim_end_matches(" - Excel")
-        .trim_end_matches(" - PowerPoint")
-        .trim_end_matches(" [Modo de Compatibilidade]")
-        .trim();
+/// Limpa sufixos padrão do Office do título da janela para os 7 aplicativos suportados.
+pub fn limpar_titulo_documento(titulo: &str) -> String {
+    let mut limpo = titulo.trim();
+    const SUFIXOS: &[&str] = &[
+        " - Word",
+        " - Excel",
+        " - PowerPoint",
+        " - Access",
+        " - Project",
+        " - Visio",
+        " - Publisher",
+        " [Modo de Compatibilidade]",
+        " (Modo de Compatibilidade)",
+        " [Somente Leitura]",
+        " (Somente Leitura)",
+        " [Read-Only]",
+        " (Read-Only)",
+        " - Salvo",
+        " - Salvando...",
+        " - Gravado",
+        " - Saved",
+        " - Saving...",
+        " - Microsoft Word",
+        " - Microsoft Excel",
+        " - Microsoft PowerPoint",
+        " - Microsoft Access",
+        " - Microsoft Project",
+        " - Microsoft Visio",
+        " - Microsoft Publisher",
+    ];
+
+    let mut alterado = true;
+    while alterado {
+        alterado = false;
+        for sufixo in SUFIXOS {
+            if limpo.ends_with(sufixo) {
+                limpo = limpo[..limpo.len() - sufixo.len()].trim();
+                alterado = true;
+            }
+        }
+    }
 
     if limpo.is_empty() {
         "Documento".to_string()
@@ -861,7 +2224,7 @@ fn limpar_titulo_documento(titulo: &str) -> String {
     }
 }
 
-/// Lista todas as janelas Office visíveis do processo atual.
+/// Lista todas as janelas Office do processo atual para os 7 aplicativos suportados (incluindo janelas ocultas no modo de janela única).
 pub fn listar_janelas_processo() -> Vec<(HWND, String)> {
     let mut janelas: Vec<(HWND, String)> = Vec::new();
     unsafe {
@@ -874,9 +2237,9 @@ pub fn listar_janelas_processo() -> Vec<(HWND, String)> {
 }
 
 unsafe extern "system" fn enum_proc_processo(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    unsafe {
-        if !IsWindowVisible(hwnd).as_bool() {
-            return BOOL(1);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return;
         }
 
         let mut pid = 0u32;
@@ -885,30 +2248,39 @@ unsafe extern "system" fn enum_proc_processo(hwnd: HWND, lparam: LPARAM) -> BOOL
 
         if pid == current_pid {
             let class_name = extrair_classe_janela(hwnd);
-            let is_office = class_name == "OpusApp"
-                || class_name == "XLMAIN"
-                || class_name == "PPTFrameClass";
+            let tipo_app = obter_tipo_app(&class_name);
 
-            if is_office {
+            // Filtrar apenas janelas do mesmo aplicativo do Office
+            if tipo_app.e_office() {
+                // Descartar janelas secundárias/popups (diálogos modais, menus suspensos)
+                let owner = windows::Win32::UI::WindowsAndMessaging::GetWindow(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::GW_OWNER,
+                );
+                if let Ok(owner_hwnd) = owner && !owner_hwnd.is_invalid() && owner_hwnd.0 as usize != 0 {
+                    return;
+                }
+
+                let titulo = extrair_texto_janela(hwnd);
+                // No Office, janelas principais de documentos possuem título não-vazio
+                if titulo.trim().is_empty() {
+                    return;
+                }
+
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
                 let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
 
-                // Filtrar apenas janelas reais com tamanho visível
-                if w > 150 && h > 150 {
-                    let titulo = extrair_texto_janela(hwnd);
-                    let titulo_limpo = if titulo.is_empty() {
-                        "Documento".to_string()
-                    } else {
-                        limpar_titulo_documento(&titulo)
-                    };
-                    let lista = &mut *(lparam.0 as *mut Vec<(HWND, String)>);
-                    lista.push((hwnd, titulo_limpo));
+                // Filtrar apenas janelas reais de documentos (com tamanho visível ou minimizadas)
+                if (w > 150 && h > 150) || IsIconic(hwnd).as_bool() {
+                    let titulo_limpo = limpar_titulo_documento(&titulo);
+                    let janelas = &mut *(lparam.0 as *mut Vec<(HWND, String)>);
+                    janelas.push((hwnd, titulo_limpo));
                 }
             }
         }
-    }
+    }));
     BOOL(1)
 }
 
@@ -924,18 +2296,15 @@ fn listar_todas_janelas_office() -> Vec<JanelaDocumento> {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    unsafe {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
-            return BOOL(1);
+            return;
         }
 
         let class_name = extrair_classe_janela(hwnd);
-        let is_office = class_name.contains("OpusApp")
-            || class_name.contains("XLMAIN")
-            || class_name.contains("EXCEL7")
-            || class_name.contains("PPTFrameClass");
+        let tipo_app = obter_tipo_app(&class_name);
 
-        if is_office {
+        if tipo_app.e_office() {
             let mut rc = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rc);
             let w = rc.right - rc.left;
@@ -956,6 +2325,172 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
                 });
             }
         }
-    }
+    }));
     BOOL(1)
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    #[test]
+    fn test_obter_altura_barra_padrao_e_personalizada() {
+        let mut manager = TabManager::new();
+        manager.config.general.tab_bar_height = 0;
+        manager.config.theme.tab_height = 0;
+        // Altura padrão do sistema
+        assert_eq!(manager.obter_altura_barra(HWND::default()), 28);
+
+        // Modifica altura geral
+        manager.config.general.tab_bar_height = 34;
+        assert_eq!(manager.obter_altura_barra(HWND::default()), 34);
+
+        // Modifica com altura de tema
+        manager.config.general.tab_bar_height = 0;
+        manager.config.theme.tab_height = 30;
+        assert_eq!(manager.obter_altura_barra(HWND::default()), 30);
+    }
+
+    #[test]
+    fn test_obter_tipo_app_7_aplicativos() {
+        assert_eq!(obter_tipo_app("OpusApp"), TipoAppOffice::Word);
+        assert_eq!(obter_tipo_app("XLMAIN"), TipoAppOffice::Excel);
+        assert_eq!(obter_tipo_app("EXCEL7"), TipoAppOffice::Excel);
+        assert_eq!(obter_tipo_app("EXCEL2"), TipoAppOffice::Excel);
+        assert_eq!(obter_tipo_app("PPTFrameClass"), TipoAppOffice::PowerPoint);
+        assert_eq!(obter_tipo_app("MSACCESS"), TipoAppOffice::Access);
+        assert_eq!(obter_tipo_app("PB"), TipoAppOffice::Project);
+        assert_eq!(obter_tipo_app("VISIO"), TipoAppOffice::Visio);
+        assert_eq!(obter_tipo_app("PUBLISHER"), TipoAppOffice::Publisher);
+        assert_eq!(obter_tipo_app("opusapp"), TipoAppOffice::Word);
+        assert_eq!(obter_tipo_app("XLMAIN"), TipoAppOffice::Excel);
+        assert_eq!(obter_tipo_app("PBToolbar"), TipoAppOffice::Desconhecido);
+
+        // Nomes amigáveis e flag de suporte
+        assert!(TipoAppOffice::Word.e_office());
+        assert_eq!(TipoAppOffice::Word.nome(), "Word");
+        assert!(TipoAppOffice::Excel.e_office());
+        assert_eq!(TipoAppOffice::Excel.nome(), "Excel");
+        assert!(TipoAppOffice::PowerPoint.e_office());
+        assert_eq!(TipoAppOffice::PowerPoint.nome(), "PowerPoint");
+        assert!(TipoAppOffice::Access.e_office());
+        assert_eq!(TipoAppOffice::Access.nome(), "Access");
+        assert!(TipoAppOffice::Project.e_office());
+        assert_eq!(TipoAppOffice::Project.nome(), "Project");
+        assert!(TipoAppOffice::Visio.e_office());
+        assert_eq!(TipoAppOffice::Visio.nome(), "Visio");
+        assert!(TipoAppOffice::Publisher.e_office());
+        assert_eq!(TipoAppOffice::Publisher.nome(), "Publisher");
+
+        // Classe desconhecida
+        let desc = obter_tipo_app("Notepad");
+        assert!(!desc.e_office());
+        assert_eq!(desc, TipoAppOffice::Desconhecido);
+        assert_eq!(desc.nome(), "Desconhecido");
+    }
+
+    #[test]
+    fn test_identificadores_menu_contexto_unicos() {
+        let ids = [
+            IDM_FECHAR,
+            IDM_FECHAR_OUTRAS,
+            IDM_FECHAR_DIREITA,
+            IDM_COPIAR_CAMINHO,
+            IDM_ABRIR_PASTA,
+            IDM_NOVA_ABA,
+            IDM_FECHAR_TODAS,
+        ];
+        let mut set = std::collections::HashSet::new();
+        for &id in &ids {
+            assert!(id > 0);
+            assert!(set.insert(id), "ID duplicado no menu de contexto: {}", id);
+        }
+    }
+
+    #[test]
+    fn test_limpar_titulo_documento_7_aplicativos() {
+        assert_eq!(
+            limpar_titulo_documento("Proposta Comercial.docx - Word"),
+            "Proposta Comercial.docx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Planilha Orcamentaria.xlsx - Excel"),
+            "Planilha Orcamentaria.xlsx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Apresentacao.pptx - PowerPoint"),
+            "Apresentacao.pptx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("BancoDados.accdb - Access"),
+            "BancoDados.accdb"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Cronograma.mpp - Project"),
+            "Cronograma.mpp"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Diagrama.vsdx - Visio"),
+            "Diagrama.vsdx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Folheto.pub - Publisher"),
+            "Folheto.pub"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Documento Antigo.doc [Modo de Compatibilidade] - Word"),
+            "Documento Antigo.doc"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Pasta1.xlsx - Salvo - Excel"),
+            "Pasta1.xlsx"
+        );
+        assert_eq!(
+            limpar_titulo_documento("Relatorio.xlsx [Somente Leitura] - Excel"),
+            "Relatorio.xlsx"
+        );
+        assert_eq!(limpar_titulo_documento(""), "Documento");
+    }
+
+    #[test]
+    fn test_calcular_y_ribbon_com_dpi() {
+        let y = calcular_y_ribbon(HWND::default());
+        assert!(y >= 100, "Y ribbon deve ser maior que 100: {}", y);
+    }
+
+    #[test]
+    fn test_pode_descarregar_inicial() {
+        desativar_gerenciador_global();
+        assert!(pode_descarregar());
+    }
+
+    #[test]
+    fn test_despacho_com_hwnd_invalido_sem_panico() {
+        // Assegurar thread safety e ausência de pânico em HWNDs nulos/inválidos
+        despachar_timer(HWND::default());
+        despachar_size(HWND::default());
+        despachar_notify(HWND::default(), LPARAM(0));
+        despachar_destroy(HWND::default());
+        despachar_inicializar(HWND::default());
+        despachar_recarregar(HWND::default());
+        despachar_tab_mbutton_up(HWND::default(), 0, 0);
+        despachar_tab_rbutton_up(HWND::default(), 0, 0);
+        despachar_tab_context_menu(HWND::default(), 0, 0);
+        despachar_tab_context_menu_teclado(HWND::default());
+        despachar_tab_lbutton_dblclk(HWND::default(), 0, 0);
+        despachar_tab_mousewheel(HWND::default(), 120);
+        assert!(!despachar_keydown(HWND::default(), 0x09));
+    }
+
+    #[test]
+    fn test_tratar_mousewheel_e_keydown_sem_panico() {
+        let mut manager = TabManager::new();
+        // Não deve entrar em pânico mesmo com lista de estados vazia
+        manager.tratar_mousewheel(HWND::default(), 120);
+        manager.tratar_mousewheel(HWND::default(), -120);
+        manager.tratar_lbutton_dblclk(HWND::default(), 10, 10);
+        assert!(!manager.tratar_keydown(HWND::default(), 0x09));
+        assert!(!manager.tratar_keydown(HWND::default(), b'W' as usize));
+        assert!(!manager.tratar_keydown(HWND::default(), b'T' as usize));
+    }
 }

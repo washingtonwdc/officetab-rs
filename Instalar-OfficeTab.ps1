@@ -36,14 +36,14 @@ Write-Host "[OK] DLL localizada: $FullPath" -ForegroundColor Green
 # Limpar chaves legadas com conflito se existirem no escopo do usuario
 Remove-Item -Path "HKCU:\Software\Classes\OfficeTabs.Connect" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "HKCU:\Software\Classes\CLSID\{1c8ba3cd-5248-4611-8a6e-8ccbaf89b651}" -Recurse -Force -ErrorAction SilentlyContinue
-foreach ($OldApp in @("Word", "Excel", "PowerPoint")) {
+foreach ($OldApp in @("Word", "Excel", "PowerPoint", "Access", "Project", "Visio", "Publisher")) {
     Remove-Item -Path "HKCU:\Software\Microsoft\Office\$OldApp\Addins\OfficeTabs.Connect" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $ProgId = "OfficeTabRs.Connect"
 $Clsid = "{9a1929ef-1495-413e-993c-326dd15e35df}"
 $Descricao = "Office Tab Rust"
-$Aplicativos = @("Word", "Excel", "PowerPoint")
+$Aplicativos = @("Word", "Excel", "PowerPoint", "Access", "Project", "Visio", "Publisher")
 
 # 2. Registrar ProgID em HKCU:\Software\Classes
 $ProgIdPath = "HKCU:\Software\Classes\$ProgId"
@@ -97,10 +97,10 @@ foreach ($App in $Aplicativos) {
 }
 
 # 6. Verificar se processos do Office estao abertos
-$processosAbertos = Get-Process winword, excel, powerpnt -ErrorAction SilentlyContinue
+$processosAbertos = Get-Process winword, excel, powerpnt, msaccess, winproj, visio, mspub -ErrorAction SilentlyContinue
 if ($processosAbertos) {
     Write-Host "`n[AVISO] Aplicativos do Office foram detectados em execucao ($($processosAbertos.ProcessName -join ', '))." -ForegroundColor Yellow
-    Write-Host "Feche e reabra o Word/Excel/PowerPoint para que o novo suplemento seja carregado." -ForegroundColor Yellow
+    Write-Host "Feche e reabra os aplicativos do Office para que o novo suplemento seja carregado." -ForegroundColor Yellow
 }
 
 Write-Host "`n[SUCESSO] Office Tab Pro (Rust) instalado e ativado com sucesso no perfil do usuario!" -ForegroundColor Green

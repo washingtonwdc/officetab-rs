@@ -29,7 +29,19 @@ const ADDIN_CLSID_STR: &str = "{9a1929ef-1495-413e-993c-326dd15e35df}";
 const ADDIN_DESC: &str = "Office Tab Rust";
 const LOAD_BEHAVIOR: u32 = 3; // 3 = Carregar na inicialização do Office
 
-const OFFICE_APPS: &[&str] = &["Word", "Excel", "PowerPoint"];
+const OFFICE_APPS: &[&str] = &[
+    "Word",
+    "Excel",
+    "PowerPoint",
+    "Access",
+    "Project",
+    "Visio",
+    "Publisher",
+];
+
+fn registry_error(status: WIN32_ERROR) -> windows::core::Error {
+    windows::core::HRESULT::from_win32(status.0).into()
+}
 
 fn criar_chave(hkey_raiz: HKEY, subkey: &str) -> Result<HKEY> {
     unsafe {
@@ -49,7 +61,7 @@ fn criar_chave(hkey_raiz: HKEY, subkey: &str) -> Result<HKEY> {
         );
 
         if status != WIN32_ERROR(0) {
-            return Err(windows::core::Error::from_win32());
+            return Err(registry_error(status));
         }
 
         Ok(hkey_resultado)
@@ -80,7 +92,7 @@ fn definir_valor_string(hkey: HKEY, nome: Option<&str>, valor: &str) -> Result<(
         );
 
         if status != WIN32_ERROR(0) {
-            return Err(windows::core::Error::from_win32());
+            return Err(registry_error(status));
         }
 
         Ok(())
@@ -101,7 +113,7 @@ fn definir_valor_dword(hkey: HKEY, nome: &str, valor: u32) -> Result<()> {
         );
 
         if status != WIN32_ERROR(0) {
-            return Err(windows::core::Error::from_win32());
+            return Err(registry_error(status));
         }
 
         Ok(())
@@ -157,7 +169,7 @@ pub fn register_server() -> Result<()> {
         let _ = RegCloseKey(k_inproc);
     }
 
-    // 3. Registrar Add-in para Word, Excel e PowerPoint
+    // 3. Registrar Add-in para todos os 7 aplicativos Office (Word, Excel, PowerPoint, Access, Project, Visio, Publisher)
     for app in OFFICE_APPS {
         let subkey = format!(
             "Software\\Microsoft\\Office\\{}\\Addins\\{}",

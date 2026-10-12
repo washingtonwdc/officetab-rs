@@ -22,8 +22,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::BOOL;
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::core::{Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, implement};
+use windows::Win32::System::Com::{
+    DISPPARAMS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, IClassFactory, IClassFactory_Impl,
+    IDispatch,
+};
+use windows::Win32::System::Variant::{VT_DISPATCH, VariantClear};
+use windows::core::{
+    Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement, w,
+};
 
 /// GUIDs oficiais de classes e interfaces do Microsoft Office
 pub const ADDIN_CLSID: GUID = GUID::from_u128(0x9a1929ef_1495_413e_993c_326dd15e35df);
@@ -31,6 +37,153 @@ pub const ADDIN_PROG_ID: &str = "OfficeTabRs.Connect";
 
 pub const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
 pub const IID_IDTEXTENSIBILITY2: GUID = GUID::from_u128(0xb65ad801_abaf_11d0_bb8b_00a0c90f2744);
+
+static OFFICE_APP_DISPATCH: Mutex<Option<usize>> = Mutex::new(None);
+
+pub fn salvar_application_dispatch(raw_ptr: *mut c_void) {
+    if raw_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let unk = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IUnknown>(&raw_ptr));
+        let cloned = (*unk).clone();
+        let raw = cloned.into_raw();
+        if let Ok(mut guard) = OFFICE_APP_DISPATCH.lock() {
+            *guard = Some(raw as usize);
+        }
+        crate::tab_manager::log_debug(&format!(
+            "salvar_application_dispatch: salvo com sucesso ptr=0x{:X}",
+            raw as usize
+        ));
+    }
+}
+
+pub fn liberar_application_dispatch() {
+    if let Ok(mut guard) = OFFICE_APP_DISPATCH.lock()
+        && let Some(ptr_val) = guard.take()
+    {
+        unsafe {
+            let _ = IUnknown::from_raw(ptr_val as *mut c_void);
+            crate::tab_manager::log_debug("liberar_application_dispatch: liberado com sucesso");
+        }
+    }
+}
+
+pub fn criar_documento_com() -> bool {
+    let guard = match OFFICE_APP_DISPATCH.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let raw_ptr = match *guard {
+        Some(p) => p as *mut c_void,
+        None => {
+            crate::tab_manager::log_debug("criar_documento_com: OFFICE_APP_DISPATCH é None");
+            return false;
+        }
+    };
+    drop(guard);
+
+    unsafe {
+        let app = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IDispatch>(&raw_ptr));
+
+        // Nomes das coleções de documentos nos principais apps Office:
+        // Word -> "Documents"
+        // Excel -> "Workbooks"
+        // PowerPoint -> "Presentations"
+        // Project -> "Projects"
+        let colecoes = [
+            w!("Documents"),
+            w!("Workbooks"),
+            w!("Presentations"),
+            w!("Projects"),
+        ];
+
+        for nome in colecoes {
+            let mut dispid_col = 0i32;
+            let hr = app.GetIDsOfNames(&GUID::zeroed(), &nome, 1, 0, &mut dispid_col);
+            if hr.is_err() {
+                continue;
+            }
+
+            let dp = DISPPARAMS::default();
+            let mut result_col = VARIANT::default();
+            let hr_col = app.Invoke(
+                dispid_col,
+                &GUID::zeroed(),
+                0,
+                DISPATCH_PROPERTYGET,
+                &dp,
+                Some(&mut result_col),
+                None,
+                None,
+            );
+            if hr_col.is_err() {
+                let _ = VariantClear(&mut result_col);
+                continue;
+            }
+
+            #[repr(C)]
+            struct RawVariant {
+                vt: u16,
+                r1: u16,
+                r2: u16,
+                r3: u16,
+                pdisp_val: *mut c_void,
+                extra: usize,
+            }
+            let raw = &result_col as *const VARIANT as *const RawVariant;
+            if (*raw).vt == VT_DISPATCH.0 && !(*raw).pdisp_val.is_null() {
+                let col = std::mem::ManuallyDrop::new(std::mem::transmute_copy::<*mut c_void, IDispatch>(&(*raw).pdisp_val));
+                let mut add_id = 0i32;
+                let add_name = w!("Add");
+                let hr_add_name = col.GetIDsOfNames(&GUID::zeroed(), &add_name, 1, 0, &mut add_id);
+                let mut sucesso = false;
+                if hr_add_name.is_ok() {
+                    let mut result_doc = VARIANT::default();
+                    let hr_add = col.Invoke(
+                        add_id,
+                        &GUID::zeroed(),
+                        0,
+                        DISPATCH_METHOD,
+                        &dp,
+                        Some(&mut result_doc),
+                        None,
+                        None,
+                    );
+                    let _ = VariantClear(&mut result_doc);
+
+                    if hr_add.is_ok() {
+                        crate::tab_manager::log_debug(
+                            "criar_documento_com: Novo documento criado com SUCESSO via COM!",
+                        );
+                        sucesso = true;
+                    } else {
+                        crate::tab_manager::log_debug(&format!(
+                            "criar_documento_com: Invoke(Add) falhou: {:?}",
+                            hr_add
+                        ));
+                    }
+                } else {
+                    crate::tab_manager::log_debug(&format!(
+                        "criar_documento_com: GetIDsOfNames(Add) falhou: {:?}",
+                        hr_add_name
+                    ));
+                }
+
+                // Libera result_col de forma segura uma única vez
+                let _ = VariantClear(&mut result_col);
+                if sucesso {
+                    return true;
+                }
+            } else {
+                let _ = VariantClear(&mut result_col);
+            }
+        }
+
+        crate::tab_manager::log_debug("criar_documento_com: nenhuma colecao Office respondeu");
+        false
+    }
+}
 
 const S_OK: HRESULT = HRESULT(0);
 const E_NOTIMPL: HRESULT = HRESULT(0x80004001u32 as i32);
@@ -191,12 +344,13 @@ unsafe extern "system" fn addin_invoke(
 
 unsafe extern "system" fn addin_on_connection(
     this: *mut c_void,
-    _application: *mut c_void,
-    _connect_mode: i32,
+    application: *mut c_void,
+    connect_mode: i32,
     _add_in_inst: *mut c_void,
     _custom: *mut *mut c_void,
 ) -> HRESULT {
-    crate::tab_manager::log_debug(&format!("addin_on_connection: mode={}", _connect_mode));
+    crate::tab_manager::log_debug(&format!("addin_on_connection: mode={}", connect_mode));
+    salvar_application_dispatch(application);
     let instance = unsafe { &*(this as *const AddinInstance) };
     let app = crate::implementation::OfficeTab::new();
     // initialize() inicia a thread de monitoramento REA — ela fará o PostMessage
@@ -210,13 +364,16 @@ unsafe extern "system" fn addin_on_connection(
     S_OK
 }
 
-
 unsafe extern "system" fn addin_on_disconnection(
     this: *mut c_void,
     _remove_mode: i32,
     _custom: *mut *mut c_void,
 ) -> HRESULT {
-    crate::tab_manager::log_debug(&format!("addin_on_disconnection: remove_mode={}", _remove_mode));
+    crate::tab_manager::log_debug(&format!(
+        "addin_on_disconnection: remove_mode={}",
+        _remove_mode
+    ));
+    liberar_application_dispatch();
     let instance = unsafe { &*(this as *const AddinInstance) };
     if let Ok(mut lock) = instance.instancia.lock()
         && let Some(app) = lock.take()
@@ -356,7 +513,9 @@ pub unsafe fn get_class_object(
     consultar_interface(&fabrica, riid, ppv)
 }
 
-/// Indica se o COM pode descarregar a DLL sem invalidar objetos vivos.
+/// Indica se o COM pode descarregar a DLL sem invalidar objetos vivos e garantindo cleanup de threads.
 pub fn can_unload_now() -> bool {
-    OBJETOS_ATIVOS.load(Ordering::Acquire) == 0 && BLOQUEIOS_SERVIDOR.load(Ordering::Acquire) == 0
+    OBJETOS_ATIVOS.load(Ordering::Acquire) == 0
+        && BLOQUEIOS_SERVIDOR.load(Ordering::Acquire) == 0
+        && crate::tab_manager::pode_descarregar()
 }

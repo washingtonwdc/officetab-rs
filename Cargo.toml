@@ -9,6 +9,10 @@ description = "Office Tab Pro reimplementation in Rust - COM Add-in with window 
 name = "officetab_rs"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "officetab-config"
+path = "src/config_main.rs"
+
 [dependencies]
 windows = { version = "0.58", features = [
     "implement",
@@ -16,6 +20,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -23,6 +28,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_System_Registry",
     "Win32_System_ProcessStatus",
     "Win32_Networking_WinHttp",
@@ -30,5 +36,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics",
     "Win32_System_Threading",
     "Win32_System_Memory",
+    "Win32_System_DataExchange",
 ] }
 windows-core = "0.58"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
