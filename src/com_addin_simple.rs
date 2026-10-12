@@ -1,3 +1,19 @@
+// Implementacao binaria exata de IDTExtensibility2 e IClassFactory para o Microsoft Office.
+//
+// Copyright 2024 The OfficeTabRs Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//!
 //! Implementacao binaria exata de IDTExtensibility2 e IClassFactory para o Microsoft Office.
 #![allow(non_snake_case)]
 
@@ -200,6 +216,7 @@ unsafe extern "system" fn addin_on_disconnection(
     _remove_mode: i32,
     _custom: *mut *mut c_void,
 ) -> HRESULT {
+    crate::tab_manager::log_debug(&format!("addin_on_disconnection: remove_mode={}", _remove_mode));
     let instance = unsafe { &*(this as *const AddinInstance) };
     if let Ok(mut lock) = instance.instancia.lock()
         && let Some(app) = lock.take()
@@ -231,6 +248,7 @@ unsafe extern "system" fn addin_on_begin_shutdown(
     this: *mut c_void,
     _custom: *mut *mut c_void,
 ) -> HRESULT {
+    crate::tab_manager::log_debug("addin_on_begin_shutdown");
     let instance = unsafe { &*(this as *const AddinInstance) };
     if let Ok(mut lock) = instance.instancia.lock()
         && let Some(app) = lock.take()

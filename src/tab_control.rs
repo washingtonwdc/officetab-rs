@@ -1,3 +1,19 @@
+// Wrapper para controle de abas nativo do Windows (SysTabControl32).
+//
+// Copyright 2024 The OfficeTabRs Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -14,9 +30,9 @@ use windows::Win32::UI::Controls::{
     TCM_SETCURSEL, TCS_FOCUSNEVER, TCS_TABS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, MoveWindow, SendMessageW, SetWindowPos,
-    ShowWindow, HMENU, HWND_TOP, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
+    BringWindowToTop, CreateWindowExW, DestroyWindow, MoveWindow, SendMessageW, SetWindowPos,
+    ShowWindow, HMENU, HWND_TOP, SWP_SHOWWINDOW, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 
@@ -69,7 +85,12 @@ impl TabControl {
             let _ = InitCommonControlsEx(&icex);
 
             let estilo = WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | TCS_TABS | TCS_FOCUSNEVER,
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_CLIPSIBLINGS.0
+                    | WS_CLIPCHILDREN.0
+                    | TCS_TABS
+                    | TCS_FOCUSNEVER,
             );
 
             // CRÍTICO: usar o HINSTANCE da nossa DLL, não do processo do Word
@@ -114,8 +135,9 @@ impl TabControl {
                 y,
                 largura,
                 altura,
-                SWP_SHOWWINDOW | SWP_NOZORDER,
+                SWP_SHOWWINDOW,
             );
+            let _ = BringWindowToTop(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, true);
@@ -211,11 +233,32 @@ impl TabControl {
                 y,
                 largura,
                 altura,
-                SWP_SHOWWINDOW | SWP_NOZORDER,
+                SWP_SHOWWINDOW,
             )?;
             let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(self.hwnd, None, true);
             Ok(())
+        }
+    }
+
+    /// Força a repintura imediata e traz para a frente da Z-Order.
+    pub fn repaint(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                    | SWP_SHOWWINDOW,
+            );
+            let _ = BringWindowToTop(self.hwnd);
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = InvalidateRect(self.hwnd, None, true);
+            let _ = UpdateWindow(self.hwnd);
         }
     }
 
