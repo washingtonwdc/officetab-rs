@@ -243,6 +243,11 @@ pub fn localizar_area_documento(hwnd_top: HWND) -> Option<HWND> {
             w!("PUBDesk"),       // Publisher layout desk
             w!("mdiClass"),      // Modern Office MDI container
             w!("_WwG"),          // Word document edit area
+            // Excel adicional para versões modernas
+            w!("EXCEL7"),        // Excel 7+ document area
+            w!("EXCEL2"),        // Excel 2 document area
+            w!("Sheet"),         // Excel worksheet
+            w!("XLSpreadsheet"), // Excel spreadsheet class
         ];
 
         for &classe in CLASSES_DOC {
@@ -250,11 +255,33 @@ pub fn localizar_area_documento(hwnd_top: HWND) -> Option<HWND> {
                 .unwrap_or_default();
             if !child.is_invalid() && IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
-                let _ = GetWindowRect(child, &mut rc);
-                let w = rc.right - rc.left;
-                let h = rc.bottom - rc.top;
-                if w > 80 && h > 80 {
-                    return Some(child);
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let w = rc.right - rc.left;
+                    let h = rc.bottom - rc.top;
+                    if w > 80 && h > 80 {
+                        return Some(child);
+                    }
+                }
+            }
+        }
+
+        // Fallback: procurar qualquer janela filha grande e visível
+        let mut child = HWND::default();
+        loop {
+            child = match FindWindowExW(hwnd_top, child, PCWSTR::null(), PCWSTR::null()) {
+                Ok(h) if !h.is_invalid() => h,
+                _ => break,
+            };
+            if IsWindowVisible(child).as_bool() {
+                let mut rc = RECT::default();
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let w = rc.right - rc.left;
+                    let h = rc.bottom - rc.top;
+                    if w > 200 && h > 200 {
+                        let classe = extrair_classe_janela(child);
+                        log_debug(&format!("localizar_area_documento: fallback encontrou classe '{}' ({})x({})", classe, w, h));
+                        return Some(child);
+                    }
                 }
             }
         }
@@ -379,7 +406,8 @@ unsafe impl Sync for EstadoJanela {}
 /// aplicando verificação completa com DPI awareness e limites estritos da Ribbon.
 pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
     let dpi = crate::utils::get_dpi_for_window(hwnd_top);
-    let escala = |px: i32| -> i32 { ((px * dpi as i32) + 48) / 96 };
+    let dpi_safe = if dpi == 0 { 96 } else { dpi };
+    let escala = |px: i32| -> i32 { ((px * dpi_safe as i32) + 48) / 96 };
 
     unsafe {
         // No Microsoft Excel, se a Barra de Fórmulas (EXCEL< / EXCEL;) estiver visível,
@@ -397,19 +425,18 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             }
             if !formula_bar.is_invalid() && IsWindowVisible(formula_bar).as_bool() {
                 let mut rc = RECT::default();
-                let _ = GetWindowRect(formula_bar, &mut rc);
-                let mut pt = POINT {
-                    x: rc.left,
-                    y: rc.top,
-                };
-                let _ = ScreenToClient(hwnd_top, &mut pt);
-                let h = rc.bottom - rc.top;
-                let bottom = pt.y + h;
-                // A barra de fórmulas pode começar em pt.y ~25-35px quando a Ribbon está recolhida,
-                // ou em pt.y ~120-145px quando a Ribbon está expandida.
-                // Sua borda inferior é exatamente onde a barra de abas deve se ancorar.
-                if pt.y >= 0 && bottom > escala(20) && bottom < escala(350) {
-                    return bottom;
+                if GetWindowRect(formula_bar, &mut rc).is_ok() {
+                    let mut pt = POINT { x: rc.left, y: rc.top };
+                    if ScreenToClient(hwnd_top, &mut pt).as_bool() {
+                        let h = rc.bottom - rc.top;
+                        let bottom = pt.y + h;
+                        // A barra de fórmulas pode começar em pt.y ~25-35px quando a Ribbon está recolhida,
+                        // ou em pt.y ~120-145px quando a Ribbon está expandida.
+                        // Sua borda inferior é exatamente onde a barra de abas deve se ancorar.
+                        if pt.y >= 0 && bottom > escala(20) && bottom < escala(350) {
+                            return bottom.clamp(escala(20), escala(350));
+                        }
+                    }
                 }
             }
         }
@@ -423,15 +450,14 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             };
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
-                let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT {
-                    x: rc.left,
-                    y: rc.top,
-                };
-                let _ = ScreenToClient(hwnd_top, &mut pt);
-                let h = rc.bottom - rc.top;
-                if pt.y >= escala(20) && pt.y < escala(250) && pt.x.abs() <= escala(4) {
-                    return (pt.y + h).clamp(escala(25), escala(280)); // Borda inferior do DropShadow
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let mut pt = POINT { x: rc.left, y: rc.top };
+                    if ScreenToClient(hwnd_top, &mut pt).as_bool() {
+                        let h = rc.bottom - rc.top;
+                        if pt.y >= escala(20) && pt.y < escala(250) && pt.x.abs() <= escala(4) {
+                            return (pt.y + h).clamp(escala(25), escala(280)); // Borda inferior do DropShadow
+                        }
+                    }
                 }
             }
         }
@@ -445,19 +471,18 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             };
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
-                let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT {
-                    x: rc.left,
-                    y: rc.top,
-                };
-                let _ = ScreenToClient(hwnd_top, &mut pt);
-                let h = rc.bottom - rc.top;
-                if pt.x.abs() <= escala(4)
-                    && pt.y <= escala(25)
-                    && h >= escala(20)
-                    && h < escala(250)
-                {
-                    return (pt.y + h).clamp(escala(25), escala(280));
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let mut pt = POINT { x: rc.left, y: rc.top };
+                    if ScreenToClient(hwnd_top, &mut pt).as_bool() {
+                        let h = rc.bottom - rc.top;
+                        if pt.x.abs() <= escala(4)
+                            && pt.y <= escala(25)
+                            && h >= escala(20)
+                            && h < escala(250)
+                        {
+                            return (pt.y + h).clamp(escala(25), escala(280));
+                        }
+                    }
                 }
             }
         }
@@ -471,21 +496,20 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             };
             if IsWindowVisible(child).as_bool() {
                 let mut rc = RECT::default();
-                let _ = GetWindowRect(child, &mut rc);
-                let mut pt = POINT {
-                    x: rc.left,
-                    y: rc.top,
-                };
-                let _ = ScreenToClient(hwnd_top, &mut pt);
-                let w = rc.right - rc.left;
-                let h = rc.bottom - rc.top;
-                if pt.x.abs() <= escala(4)
-                    && pt.y <= escala(25)
-                    && w > escala(200)
-                    && h >= escala(20)
-                    && h < escala(250)
-                {
-                    return (pt.y + h).clamp(escala(25), escala(280));
+                if GetWindowRect(child, &mut rc).is_ok() {
+                    let mut pt = POINT { x: rc.left, y: rc.top };
+                    if ScreenToClient(hwnd_top, &mut pt).as_bool() {
+                        let w = rc.right - rc.left;
+                        let h = rc.bottom - rc.top;
+                        if pt.x.abs() <= escala(4)
+                            && pt.y <= escala(25)
+                            && w > escala(200)
+                            && h >= escala(20)
+                            && h < escala(250)
+                        {
+                            return (pt.y + h).clamp(escala(25), escala(280));
+                        }
+                    }
                 }
             }
         }
@@ -498,19 +522,18 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
             && let Some(doc_view) = localizar_area_documento(hwnd_top)
         {
             let mut rc = RECT::default();
-            let _ = GetWindowRect(doc_view, &mut rc);
-            let mut pt = POINT {
-                x: rc.left,
-                y: rc.top,
-            };
-            let _ = ScreenToClient(hwnd_top, &mut pt);
-            if pt.y >= escala(25) && pt.y < escala(250) {
-                return pt.y;
+            if GetWindowRect(doc_view, &mut rc).is_ok() {
+                let mut pt = POINT { x: rc.left, y: rc.top };
+                if ScreenToClient(hwnd_top, &mut pt).as_bool() {
+                    if pt.y >= escala(25) && pt.y < escala(250) {
+                        return pt.y.clamp(escala(25), escala(250));
+                    }
+                }
             }
         }
 
         // Fallback padrão ajustado para DPI (148px base em 96 DPI do Office moderno com Ribbon expandido)
-        escala(148)
+        escala(148).clamp(20, 350)
     }
 }
 
@@ -551,6 +574,9 @@ impl TabManager {
 
     /// Retorna a altura da barra de abas configurada escalonada pelo DPI da janela especificada.
     pub fn obter_altura_barra(&self, hwnd: HWND) -> i32 {
+        if !unsafe { IsWindow(hwnd).as_bool() } {
+            return ALTURA_BARRA_ABAS;
+        }
         let base = if self.config.general.tab_bar_height > 0 {
             self.config.general.tab_bar_height
         } else if self.config.theme.tab_height > 0 {
@@ -558,7 +584,8 @@ impl TabManager {
         } else {
             ALTURA_BARRA_ABAS
         };
-        crate::tab_control::calcular_altura_por_dpi(hwnd, base)
+        let altura = crate::tab_control::calcular_altura_por_dpi(hwnd, base);
+        altura.max(18).min(64)
     }
 
     /// Recarrega as configurações persistidas do registro (temas, posicionamento, etc.).
@@ -676,22 +703,65 @@ impl TabManager {
     pub fn sincronizar_janela(&mut self, hwnd: HWND) -> Result<()> {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
+                log_debug(&format!("sincronizar_janela: HWND inválido 0x{:X}", hwnd.0 as usize));
                 self.estados.remove(&(hwnd.0 as isize));
                 return Ok(());
             }
 
             let mut rc_client = RECT::default();
-            GetClientRect(hwnd, &mut rc_client)?;
+            if GetClientRect(hwnd, &mut rc_client).is_err() {
+                log_debug(&format!("sincronizar_janela: GetClientRect falhou para HWND 0x{:X}", hwnd.0 as usize));
+                return Ok(());
+            }
 
             let largura_cliente = rc_client.right - rc_client.left;
             let altura_cliente = rc_client.bottom - rc_client.top;
 
             if largura_cliente <= 100 || altura_cliente <= 100 {
+                log_debug(&format!("sincronizar_janela: dimensões muito pequenas {}x{} para HWND 0x{:X}", largura_cliente, altura_cliente, hwnd.0 as usize));
                 return Ok(());
             }
 
             // Verificar se a janela do Office está na tela inicial ou Backstage (Novo/Abrir/Opções)
-            if backstage_esta_aberto(hwnd) {
+            // NOTA: Para Excel, a detecção de backstage pode falhar e esconder as abas incorretamente.
+            // Usamos uma verificação mais robusta que não depende de localizar_area_documento.
+            let classe_top = extrair_classe_janela(hwnd);
+            let app_tipo = obter_tipo_app(&classe_top);
+            let is_backstage = if app_tipo == TipoAppOffice::Excel {
+                // Para Excel, verificar apenas se há NetUIHWND grande cobrindo a tela
+                // (Backstage real), sem depender de localizar_area_documento
+                let mut rc_client = RECT::default();
+                if GetClientRect(hwnd, &mut rc_client).is_err() {
+                    false
+                } else {
+                    let w_client = rc_client.right - rc_client.left;
+                    let h_client = rc_client.bottom - rc_client.top;
+                    let mut child = HWND::default();
+                    let mut found_big_netui = false;
+                    loop {
+                        child = match FindWindowExW(hwnd, child, w!("NetUIHWND"), PCWSTR::null()) {
+                            Ok(h) if !h.is_invalid() => h,
+                            _ => break,
+                        };
+                        if IsWindowVisible(child).as_bool() {
+                            let mut rc = RECT::default();
+                            if GetWindowRect(child, &mut rc).is_ok() {
+                                let w = rc.right - rc.left;
+                                let h = rc.bottom - rc.top;
+                                if w > (w_client * 3 / 4) && h > (h_client * 3 / 5) {
+                                    found_big_netui = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found_big_netui
+                }
+            } else {
+                backstage_esta_aberto(hwnd)
+            };
+            log_debug(&format!("sincronizar_janela: backstage_esta_aberto={} para HWND 0x{:X} ({:?})", is_backstage, hwnd.0 as usize, app_tipo));
+            if is_backstage {
                 if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
                     && let Some(ref tab) = estado.tab_control
                 {
@@ -723,7 +793,13 @@ impl TabManager {
             estado.hwnd_doc_view = doc_view;
 
             // Calcular y_base DINAMICAMENTE para acompanhar ribbon recolhido/expandido com DPI awareness
-            let y_ribbon = calcular_y_ribbon(hwnd);
+            let y_ribbon_raw = calcular_y_ribbon(hwnd);
+            log_debug(&format!("sincronizar_janela: y_ribbon_raw={} para HWND 0x{:X}", y_ribbon_raw, hwnd.0 as usize));
+            let dpi = crate::utils::get_dpi_for_window(hwnd);
+            let dpi_safe = if dpi == 0 { 96 } else { dpi };
+            let escala = |px: i32| -> i32 { ((px * dpi_safe as i32) + 48) / 96 };
+            let y_ribbon = y_ribbon_raw.clamp(escala(20), altura_cliente - 40).max(escala(20));
+            log_debug(&format!("sincronizar_janela: y_ribbon_clamped={} (raw={}, altura_cliente={}) para HWND 0x{:X}", y_ribbon, y_ribbon_raw, altura_cliente, hwnd.0 as usize));
             estado.y_base = y_ribbon;
 
             let layout_mudou = largura_cliente != estado.ult_largura
@@ -771,7 +847,9 @@ impl TabManager {
                 if layout_mudou || y_doc != estado.ult_y_doc {
                     let h_status = calcular_altura_status_bar(hwnd, altura_cliente);
                     let h_doc = (altura_cliente - y_doc - h_status).max(10);
-                    let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                    if y_doc >= 0 && h_doc > 0 && largura_cliente > 0 && altura_cliente > 0 {
+                        let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                    }
                     estado.ult_y_doc = y_doc;
                 }
             }

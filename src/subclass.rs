@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::WindowsAndMessaging::{IsWindow};
 use windows::core::Result;
 
 const OFFICETAB_SUBCLASS_ID: usize = 0x4F544142; // 'OTAB'
@@ -156,6 +157,9 @@ fn procedimento_subclass_interno(
         // WM_SIZE / WM_WINDOWPOSCHANGED: redimensionamento da janela do Office
         // e reposicionamento de elementos internos (como recolher/expandir Ribbon com Ctrl+F1)
         WM_SIZE | WM_WINDOWPOSCHANGED => {
+            if !unsafe { IsWindow(hwnd).as_bool() } {
+                return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            }
             let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
             crate::tab_manager::despachar_size(hwnd);
             return res;
@@ -163,6 +167,12 @@ fn procedimento_subclass_interno(
 
         // WM_NOTIFY: notificações do TabControl (clique em aba, etc.)
         WM_NOTIFY => {
+            if !unsafe { IsWindow(hwnd).as_bool() } {
+                return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            }
+            if lparam.0 == 0 {
+                return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            }
             if let Some(result) = crate::tab_manager::despachar_notify(hwnd, lparam) {
                 return result;
             }
