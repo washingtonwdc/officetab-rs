@@ -41,12 +41,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
-    EVENT_OBJECT_SHOW, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW, GetClientRect,
-    GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow,
-    PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT, WM_ACTIVATE, WM_CLOSE, WS_CLIPCHILDREN,
+    EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW,
+    GetClientRect, GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
+    MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
+    WM_ACTIVATE, WM_CLOSE, WS_CLIPCHILDREN,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -401,6 +402,66 @@ unsafe impl Sync for EstadoJanela {}
 // Cálculo Dinâmico da Posição do Ribbon
 // ---------------------------------------------------------------------------
 
+/// Contexto para coletar a borda inferior da barra de fórmulas do Excel durante EnumChildWindows.
+struct ContextoFormulaBar {
+    hwnd_top: HWND,
+    bottom_cliente: i32,
+}
+
+/// Callback de EnumChildWindows: procura classes EXCEL; (Name Box) e EXCEL< (editor fx)
+/// em TODOS os descendentes (não apenas filhos diretos) e coleta a maior borda inferior
+/// convertida para coordenadas de cliente da janela principal.
+unsafe extern "system" fn callback_formula_bar(child: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let ctx = &mut *(lparam.0 as *mut ContextoFormulaBar);
+        let mut nome_buf = [0u16; 32];
+        let n = GetClassNameW(child, &mut nome_buf);
+        if n > 0 {
+            let nome = String::from_utf16_lossy(&nome_buf[..n as usize]);
+            if nome == "EXCEL;" || nome == "EXCEL<" {
+                if IsWindowVisible(child).as_bool() {
+                    let mut rc = RECT::default();
+                    if GetWindowRect(child, &mut rc).is_ok() {
+                        let mut pt = POINT {
+                            x: rc.left,
+                            y: rc.top,
+                        };
+                        if ScreenToClient(ctx.hwnd_top, &mut pt).as_bool() {
+                            let bottom = pt.y + (rc.bottom - rc.top);
+                            if bottom > ctx.bottom_cliente {
+                                ctx.bottom_cliente = bottom;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true.into() // continuar a enumeração (BOOL)
+    }
+}
+
+/// Localiza a borda inferior (em coordenadas de cliente da janela principal) da barra
+/// de fórmulas do Excel, buscando recursivamente por EXCEL; / EXCEL< em toda a árvore
+/// de janelas. Retorna None se nenhuma barra de fórmulas visível for encontrada.
+fn localizar_fim_formula_bar_excel(hwnd_top: HWND) -> Option<i32> {
+    let mut ctx = ContextoFormulaBar {
+        hwnd_top,
+        bottom_cliente: 0,
+    };
+    unsafe {
+        let ok = EnumChildWindows(
+            hwnd_top,
+            Some(callback_formula_bar),
+            LPARAM(&mut ctx as *mut ContextoFormulaBar as isize),
+        );
+        if ok.as_bool() && ctx.bottom_cliente > 0 {
+            Some(ctx.bottom_cliente)
+        } else {
+            None
+        }
+    }
+}
+
 /// Calcula a coordenada Y logo abaixo do Ribbon para ancorar a barra de abas.
 /// Detecta dinamicamente DropShadow, MsoCommandBarDock e NetUIHWND no topo,
 /// aplicando verificação completa com DPI awareness e limites estritos da Ribbon.
@@ -415,28 +476,13 @@ pub fn calcular_y_ribbon(hwnd_top: HWND) -> i32 {
         // para não obstruir o editor de fórmulas fx nem o Name Box.
         let classe_top = extrair_classe_janela(hwnd_top);
         if obter_tipo_app(&classe_top) == TipoAppOffice::Excel {
-            let mut formula_bar =
-                FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL<"), PCWSTR::null())
-                    .unwrap_or_default();
-            if formula_bar.is_invalid() || !IsWindowVisible(formula_bar).as_bool() {
-                formula_bar =
-                    FindWindowExW(hwnd_top, HWND::default(), w!("EXCEL;"), PCWSTR::null())
-                        .unwrap_or_default();
-            }
-            if !formula_bar.is_invalid() && IsWindowVisible(formula_bar).as_bool() {
-                let mut rc = RECT::default();
-                if GetWindowRect(formula_bar, &mut rc).is_ok() {
-                    let mut pt = POINT { x: rc.left, y: rc.top };
-                    if ScreenToClient(hwnd_top, &mut pt).as_bool() {
-                        let h = rc.bottom - rc.top;
-                        let bottom = pt.y + h;
-                        // A barra de fórmulas pode começar em pt.y ~25-35px quando a Ribbon está recolhida,
-                        // ou em pt.y ~120-145px quando a Ribbon está expandida.
-                        // Sua borda inferior é exatamente onde a barra de abas deve se ancorar.
-                        if pt.y >= 0 && bottom > escala(20) && bottom < escala(350) {
-                            return bottom.clamp(escala(20), escala(350));
-                        }
-                    }
+            // Busca RECURSIVA (EnumChildWindows) por EXCEL; / EXCEL< em toda a árvore
+            // de descendentes — as versões modernas do Excel não as expõem como filhos
+            // diretos de XLMAIN, o que fazia a detecção antiga falhar e cair no
+            // fallback escala(148) (barra sobreposta à Ribbon e área errada).
+            if let Some(bottom) = localizar_fim_formula_bar_excel(hwnd_top) {
+                if bottom > escala(20) && bottom < escala(350) {
+                    return bottom.clamp(escala(20), escala(350));
                 }
             }
         }
@@ -574,9 +620,6 @@ impl TabManager {
 
     /// Retorna a altura da barra de abas configurada escalonada pelo DPI da janela especificada.
     pub fn obter_altura_barra(&self, hwnd: HWND) -> i32 {
-        if !unsafe { IsWindow(hwnd).as_bool() } {
-            return ALTURA_BARRA_ABAS;
-        }
         let base = if self.config.general.tab_bar_height > 0 {
             self.config.general.tab_bar_height
         } else if self.config.theme.tab_height > 0 {
