@@ -1596,9 +1596,17 @@ impl TabManager {
                             tab_idx, doc_fechar.0 as usize
                         ));
                         if doc_fechar != doc_origem {
-                            self.alternar_para_janela(doc_origem, doc_fechar);
-                            let _ = self.sincronizar_janela(doc_fechar);
+                            // Alternância diferida antes de fechar (evita crash no Excel)
+                            unsafe {
+                                let _ = PostMessageW(
+                                    doc_fechar,
+                                    WM_OFFICETAB_ALTERNAR,
+                                    WPARAM(doc_origem.0 as usize),
+                                    LPARAM(0),
+                                );
+                            }
                         }
+                        // WM_CLOSE dispara a caixa de diálogo "Salvar?" nativa do Office
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -1627,8 +1635,14 @@ impl TabManager {
                             tab_idx, doc_fechar.0 as usize
                         ));
                         if doc_fechar != doc_origem {
-                            self.alternar_para_janela(doc_origem, doc_fechar);
-                            let _ = self.sincronizar_janela(doc_fechar);
+                            unsafe {
+                                let _ = PostMessageW(
+                                    doc_fechar,
+                                    WM_OFFICETAB_ALTERNAR,
+                                    WPARAM(doc_origem.0 as usize),
+                                    LPARAM(0),
+                                );
+                            }
                         }
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1658,8 +1672,14 @@ impl TabManager {
                             tab_idx, doc_fechar.0 as usize
                         ));
                         if doc_fechar != doc_origem {
-                            self.alternar_para_janela(doc_origem, doc_fechar);
-                            let _ = self.sincronizar_janela(doc_fechar);
+                            unsafe {
+                                let _ = PostMessageW(
+                                    doc_fechar,
+                                    WM_OFFICETAB_ALTERNAR,
+                                    WPARAM(doc_origem.0 as usize),
+                                    LPARAM(0),
+                                );
+                            }
                         }
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
