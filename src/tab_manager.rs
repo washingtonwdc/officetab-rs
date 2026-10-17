@@ -97,7 +97,7 @@ pub fn log_debug(msg: &str) {
 
 pub const OFFICETAB_CONTROL_ID: u32 = 5001;
 pub const OFFICETAB_TIMER_ID: usize = 0x544142; // 'TAB'
-pub const ALTURA_BARRA_ABAS: i32 = 36;
+pub const ALTURA_BARRA_ABAS: i32 = 44;
 
 // ---------------------------------------------------------------------------
 // Estruturas de dados
@@ -1270,8 +1270,9 @@ impl TabManager {
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
 
-                // Botão de fechar elegante ("×") com Fluent Close Button Hover
-                if show_close && (selected || hot) {
+                // Botão de fechar elegante ("×") — SEMPRE visível em todas as abas
+                // de documento (selecionadas, com hover ou não), como no Office Tab comercial
+                if show_close {
                     let close_size = 14;
                     let close_x = rc.right - close_size - 6;
                     let close_y = rc.top + (rc.bottom - rc.top - close_size) / 2;
@@ -2811,7 +2812,7 @@ mod testes {
         manager.config.general.tab_bar_height = 0;
         manager.config.theme.tab_height = 0;
         // Altura padrão do sistema
-        assert_eq!(manager.obter_altura_barra(HWND::default()), 36);
+        assert_eq!(manager.obter_altura_barra(HWND::default()), 44);
 
         // Modifica altura geral
         manager.config.general.tab_bar_height = 34;
