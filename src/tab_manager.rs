@@ -68,6 +68,13 @@ pub const WM_OFFICETAB_RECARREGAR: u32 = windows::Win32::UI::WindowsAndMessaging
 /// Mensagem customizada: criação assíncrona de novo documento.
 pub const WM_OFFICETAB_NOVO_DOC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x03;
 
+/// Mensagem customizada: alternância DIFERIDA de janela (Modo Janela Única).
+/// Postada pelo handler de clique em aba e processada FORA do WM_NOTIFY,
+/// na própria janela de destino — evita reentrância e o WM_ACTIVATE forjado
+/// com lParam=0 que causava Access Violation dentro do Excel ao alternar abas.
+/// wParam = HWND bruto da janela de origem (que será ocultada).
+pub const WM_OFFICETAB_ALTERNAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x04;
+
 // ---------------------------------------------------------------------------
 // Constantes e utilitários de log
 // ---------------------------------------------------------------------------
@@ -90,7 +97,7 @@ pub fn log_debug(msg: &str) {
 
 pub const OFFICETAB_CONTROL_ID: u32 = 5001;
 pub const OFFICETAB_TIMER_ID: usize = 0x544142; // 'TAB'
-pub const ALTURA_BARRA_ABAS: i32 = 28;
+pub const ALTURA_BARRA_ABAS: i32 = 36;
 
 // ---------------------------------------------------------------------------
 // Estruturas de dados
@@ -628,7 +635,7 @@ impl TabManager {
             ALTURA_BARRA_ABAS
         };
         let altura = crate::tab_control::calcular_altura_por_dpi(hwnd, base);
-        altura.max(18).min(64)
+        altura.max(20).min(96)
     }
 
     /// Recarrega as configurações persistidas do registro (temas, posicionamento, etc.).
@@ -723,9 +730,10 @@ impl TabManager {
             let _ = BringWindowToTop(hwnd_alvo);
             let _ = SetForegroundWindow(hwnd_alvo);
 
-            // Notifica formalmente o procedimento de janela da aplicação Office (especialmente
-            // vital no Excel para o subsistema MDI ativar a pasta de trabalho interna correspondente).
-            let _ = SendMessageW(hwnd_alvo, WM_ACTIVATE, WPARAM(1), LPARAM(0));
+            // NOTA: NÃO forjamos WM_ACTIVATE via SendMessageW. O SetForegroundWindow
+            // acima gera a ativação REAL com wParam/lParam corretos. O WM_ACTIVATE
+            // forjado com lParam=0 desreferenciava handle nulo nos internos MDI do
+            // Excel e derrubava o processo ao alternar abas (Access Violation).
 
             // MODO DE JANELA ÚNICA: Ocultar a janela anterior para que apenas
             // uma única instância/janela do Word/Excel permaneça visível na tela e na barra de tarefas.
@@ -1009,9 +1017,19 @@ impl TabManager {
                     *lock = Some((alvo.0 as isize, agora));
                 }
 
-                let _ = self.monitor_window(alvo);
-                self.alternar_para_janela(hwnd, alvo);
-                let _ = self.sincronizar_janela(alvo);
+                // ALTERNÂNCIA DIFERIDA: NÃO tocamos nas janelas dentro do WM_NOTIFY.
+                // Postamos WM_OFFICETAB_ALTERNAR para a janela de DESTINO; ela fará
+                // mostrar/ocultar/ativar no próprio contexto de mensagem, fora do
+                // handler aninhado — elimina a reentrância e o WM_ACTIVATE forjado
+                // (lParam=0) que derrubava o Excel ao alternar abas.
+                unsafe {
+                    let _ = PostMessageW(
+                        alvo,
+                        WM_OFFICETAB_ALTERNAR,
+                        WPARAM(hwnd.0 as usize),
+                        LPARAM(0),
+                    );
+                }
             }
             return Some(LRESULT(0));
         } else if (sel as usize) == total_docs {
@@ -1706,8 +1724,15 @@ impl TabManager {
         }
 
         if let Some((origem, alvo)) = transicao {
-            self.alternar_para_janela(origem, alvo);
-            let _ = self.sincronizar_janela(alvo);
+            // Alternância DIFERIDA via mensagem postada (mesma proteção do clique em aba)
+            unsafe {
+                let _ = PostMessageW(
+                    alvo,
+                    WM_OFFICETAB_ALTERNAR,
+                    WPARAM(origem.0 as usize),
+                    LPARAM(0),
+                );
+            }
         }
     }
 
@@ -1767,8 +1792,15 @@ impl TabManager {
             if (proximo as usize) < total {
                 let alvo = doc_hwnds[proximo as usize];
                 if alvo != hwnd {
-                    self.alternar_para_janela(hwnd, alvo);
-                    let _ = self.sincronizar_janela(alvo);
+                    // Alternância DIFERIDA via mensagem postada (mesma proteção do clique)
+                    unsafe {
+                        let _ = PostMessageW(
+                            alvo,
+                            WM_OFFICETAB_ALTERNAR,
+                            WPARAM(hwnd.0 as usize),
+                            LPARAM(0),
+                        );
+                    }
                 }
                 return true;
             }
@@ -2338,6 +2370,26 @@ pub fn despachar_recarregar(hwnd: HWND) {
     }));
 }
 
+/// Chamado via WM_OFFICETAB_ALTERNAR na janela de DESTINO. Blindado com catch_unwind.
+/// Executa a alternância do Modo Janela Única FORA do WM_NOTIFY de origem:
+/// wParam carrega o HWND bruto da janela de origem que deve ser ocultada.
+pub fn despachar_alternar(hwnd_alvo: HWND, hwnd_origem: HWND) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log_debug(&format!(
+            "despachar_alternar: origem=0x{:X} → destino=0x{:X}",
+            hwnd_origem.0 as usize, hwnd_alvo.0 as usize
+        ));
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            // Garantir que a janela de destino está monitorada antes de alternar
+            let _ = manager.monitor_window(hwnd_alvo);
+            manager.alternar_para_janela(hwnd_origem, hwnd_alvo);
+            let _ = manager.sincronizar_janela(hwnd_alvo);
+        }
+    }));
+}
+
 /// Chamado quando o botão esquerdo do mouse é solto sobre o controle de abas (SysTabControl32). Blindado com catch_unwind.
 pub fn despachar_tab_lbutton_up(hwnd_tab: HWND, x: i32, y: i32) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2739,7 +2791,7 @@ mod testes {
         manager.config.general.tab_bar_height = 0;
         manager.config.theme.tab_height = 0;
         // Altura padrão do sistema
-        assert_eq!(manager.obter_altura_barra(HWND::default()), 28);
+        assert_eq!(manager.obter_altura_barra(HWND::default()), 36);
 
         // Modifica altura geral
         manager.config.general.tab_bar_height = 34;

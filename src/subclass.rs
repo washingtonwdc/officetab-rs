@@ -146,6 +146,7 @@ fn procedimento_subclass_interno(
     let wm_inicializar = crate::tab_manager::WM_OFFICETAB_INICIALIZAR;
     let wm_recarregar = crate::tab_manager::WM_OFFICETAB_RECARREGAR;
     let wm_novo_doc = crate::tab_manager::WM_OFFICETAB_NOVO_DOC;
+    let wm_alternar = crate::tab_manager::WM_OFFICETAB_ALTERNAR;
 
     match msg {
         // WM_TIMER: atualização periódica (disparado na thread de UI)
@@ -202,6 +203,17 @@ fn procedimento_subclass_interno(
         // WM_OFFICETAB_NOVO_DOC: criação assíncrona de novo documento
         m if m == wm_novo_doc => {
             crate::tab_manager::despachar_novo_doc(hwnd);
+            return LRESULT(0);
+        }
+
+        // WM_OFFICETAB_ALTERNAR: alternância DIFERIDA do Modo Janela Única.
+        // Postada pelo clique em aba / Ctrl+Tab e processada AQUI, na janela de
+        // destino, FORA do WM_NOTIFY de origem (elimina a reentrância e o
+        // WM_ACTIVATE forjado com lParam=0 que derrubava o Excel ao alternar).
+        // wParam = HWND bruto da janela de origem (que será ocultada).
+        m if m == wm_alternar => {
+            let hwnd_origem = HWND(wparam.0 as *mut _);
+            crate::tab_manager::despachar_alternar(hwnd, hwnd_origem);
             return LRESULT(0);
         }
 
