@@ -80,7 +80,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            tab_bar_height: 28,
+            tab_bar_height: 44,
             multiline_tabs: true,
             tab_position: 0, // Top
             show_close_button: true,
@@ -1191,7 +1191,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = OfficeTabConfig::default();
-        assert_eq!(cfg.general.tab_bar_height, 28);
+        assert_eq!(cfg.general.tab_bar_height, 44);
         assert!(cfg.general.multiline_tabs);
         assert_eq!(cfg.general.language, "pt");
         assert!(!cfg.general.adaptive_theme_by_app);
