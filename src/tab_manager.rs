@@ -30,7 +30,7 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD, FillRect, HDC,
     HGDIOBJ, OUT_DEFAULT_PRECIS, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    TRANSPARENT, InvalidateRect, UpdateWindow,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -46,9 +46,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW,
     GetClientRect, GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
-    MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
     WM_ACTIVATE, WM_CLOSE, WS_CLIPCHILDREN,
@@ -404,6 +404,7 @@ pub struct EstadoJanela {
     pub ult_altura: i32,
     pub ult_y_ribbon: i32,
     pub ult_y_doc: i32,
+    pub ult_x_doc: i32,
 }
 
 unsafe impl Send for EstadoJanela {}
@@ -686,6 +687,7 @@ impl TabManager {
                 ult_altura: 0,
                 ult_y_ribbon: 0,
                 ult_y_doc: 0,
+                ult_x_doc: 0,
             },
         );
 
@@ -908,6 +910,9 @@ impl TabManager {
                         0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+                    // Forçar invalidação da barra logo após trazer ao topo
+                    let _ = InvalidateRect(tab.hwnd, None, true);
+                    let _ = UpdateWindow(tab.hwnd);
                 }
             }
 
@@ -916,13 +921,15 @@ impl TabManager {
                 && IsWindowVisible(dv).as_bool()
             {
                 let y_doc = y_ribbon + altura_barra;
-                if layout_mudou || y_doc != estado.ult_y_doc {
+                let dx_doc = estado.ult_x_doc != largura_cliente || y_doc != estado.ult_y_doc || layout_mudou;
+                if layout_mudou || dx_doc {
                     let h_status = calcular_altura_status_bar(hwnd, altura_cliente);
                     let h_doc = (altura_cliente - y_doc - h_status).max(10);
                     if y_doc >= 0 && h_doc > 0 && largura_cliente > 0 && altura_cliente > 0 {
                         let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
                     }
                     estado.ult_y_doc = y_doc;
+                    estado.ult_x_doc = largura_cliente;
                 }
             }
 
