@@ -44,7 +44,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
-    EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW,
+    EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GetParent, GWL_STYLE, GetClassNameW,
     GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE,
@@ -1081,14 +1081,12 @@ impl TabManager {
                 }
             }
 
-            // Popular abas com documentos abertos - apenas documentos do mesmo processo/instância
+            // Popular abas com documentos abertos
+            // As janelas não ativas do Word ficam ocultas no modo de abas,
+            // mas continuam sendo documentos abertos e precisam permanecer
+            // representadas na barra.
             let mut docs_processo = listar_janelas_processo();
-            // Filtrar apenas janelas do mesmo processo (instância independente por processo)
-            let pid_atual = unsafe { GetCurrentProcessId() };
-            docs_processo.retain(|(hwnd_doc, _)| {
-                let pid_doc = unsafe { GetWindowThreadProcessId(*hwnd_doc, Some(std::ptr::null_mut())) };
-                pid_doc == pid_atual
-            });
+            
             if docs_processo.is_empty() {
                 let tit = extrair_texto_janela(hwnd);
                 let tit_limpo = if tit.is_empty() {
@@ -1098,15 +1096,6 @@ impl TabManager {
                 };
                 docs_processo.push((hwnd, tit_limpo));
             }
-
-            // Filtrar apenas documentos do tipo correto (mesmo app)
-            let classe_atual = extrair_classe_janela(hwnd);
-            let tipo_app_atual = obter_tipo_app(&classe_atual);
-            docs_processo.retain(|(hwnd_doc, _)| {
-                let classe_doc = extrair_classe_janela(*hwnd_doc);
-                let tipo_app_doc = obter_tipo_app(&classe_doc);
-                tipo_app_doc == tipo_app_atual
-            });
 
             // Preserva rigorosamente a posição estável das abas (não altera a ordem ao alternar foco):
             let hwnds_atuais: Vec<HWND> = docs_processo.iter().map(|(h, _)| *h).collect();
