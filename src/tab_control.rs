@@ -14,11 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
-    DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, GetStockObject, HFONT, InvalidateRect,
-    OUT_DEFAULT_PRECIS, UpdateWindow,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET,
+    DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, HDC,
+    GetDC, GetStockObject, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, ReleaseDC,
+    UpdateWindow, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -31,9 +32,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DestroyWindow, HMENU, HWND_TOP, MoveWindow, SW_SHOW,
-    SWP_SHOWWINDOW, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    BringWindowToTop, CreateWindowExW, DestroyWindow, GetClientRect, HMENU, HWND_TOP, MoveWindow,
+    SW_SHOW, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -410,6 +411,7 @@ fn procedimento_tab_control_subclass_interno(
 ) -> LRESULT {
     const WM_DESTROY: u32 = 0x0002;
     const WM_NCDESTROY: u32 = 0x0082;
+    const WM_PAINT: u32 = 0x000F;
     const WM_LBUTTONUP: u32 = 0x0202;
     const WM_LBUTTONDBLCLK: u32 = 0x0203;
     const WM_MBUTTONUP: u32 = 0x0208;
@@ -418,6 +420,39 @@ fn procedimento_tab_control_subclass_interno(
     const WM_CONTEXTMENU: u32 = 0x007B;
 
     match msg {
+        // WM_PAINT: desenho customizado AQUI, no próprio controle.
+        // No Excel (SDI) o WM_NOTIFY/NM_CUSTOMDRAW que o SysTabControl32 envia ao
+        // pai (XLMAIN) é engolido pelo Excel antes da nossa subclasse vê-lo, então
+        // o desenho customizado (×, título à esquerda, cores) nunca roda via pai.
+        // Pintamos manualmente reaproveitando o desenho do TabManager.
+        //
+        // IMPORTANTE: usamos GetDC (e não BeginPaint) porque o DC do BeginPaint é
+        // recortado pela update region, que chegou vazia (ps.rcPaint=(0,0,0,0)) no
+        // Excel — todo o desenho era descartado. GetDC cobre o cliente inteiro;
+        // validamos a região depois com ValidateRect para parar o WM_PAINT.
+        WM_PAINT => {
+            // Primeiro, pinta toda a barra via GetDC (evita update region vazia do Excel).
+            let hdc = unsafe { GetDC(hwnd) };
+            if !hdc.is_invalid() {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                crate::tab_manager::despachar_tab_paint(hwnd, hdc, rc);
+                unsafe {
+                    let _ = ReleaseDC(hwnd, hdc);
+                    // Não validamos ainda: deixe o BeginPaint normal fazer o resto.
+                }
+            }
+            // Agora delega ao DefSubclassProc para que o Windows processe o WM_PAINT
+            // nativo do SysTabControl32 e não quebre o owner-draw / foco / realce do controle.
+            // Apenas validamos a região para não entrarmos em loop.
+            unsafe {
+                let _ = DefSubclassProc(hwnd, msg, wparam, lparam);
+                let _ = ValidateRect(hwnd, None);
+            }
+            return LRESULT(0);
+        }
         WM_LBUTTONUP => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;

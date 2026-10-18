@@ -22,20 +22,22 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD, FillRect, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD, FillRect, HDC,
+    HGDIOBJ, OUT_DEFAULT_PRECIS, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_NOTIFYITEMDRAW,
-    CDRF_SKIPDEFAULT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, TCN_SELCHANGE,
+    CDRF_SKIPDEFAULT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMCUSTOMDRAW_DRAW_STATE_FLAGS, NMHDR,
+    TCN_SELCHANGE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, SetFocus, VK_CONTROL, keybd_event,
@@ -44,10 +46,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW,
     GetClientRect, GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
+    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
     MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
     WM_ACTIVATE, WM_CLOSE, WS_CLIPCHILDREN,
 };
 use windows::core::{PCWSTR, Result, w};
@@ -891,6 +894,23 @@ impl TabManager {
                 estado.ult_y_ribbon = y_ribbon;
             }
 
+            // Manter o TabControl no topo da Z-order: o FullpageUIHost do Excel cobre
+            // toda a área do cliente (incluindo a barra de abas) e precisa ser superado
+            // a cada sincronização, senão a barra fica invisível.
+            if let Some(ref tab) = estado.tab_control {
+                unsafe {
+                    let _ = SetWindowPos(
+                        tab.hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+
             // Deslocar área do documento para baixo da barra de abas apenas quando o layout mudar
             if let Some(dv) = estado.hwnd_doc_view
                 && IsWindowVisible(dv).as_bool()
@@ -1056,6 +1076,24 @@ impl TabManager {
             return None;
         }
         let theme = self.tema_da_janela(hwnd);
+
+        // Diagnóstico throttled (primeiras 3 pinturas) para confirmar rota + show_close + rect
+        static LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+        let _n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if _n < 6 {
+            log_debug(&format!(
+                "CUSTOM_DRAW stage={} item={} show_close={} rc=({},{},{},{}) w={} h={}",
+                draw.dwDrawStage.0,
+                draw.dwItemSpec,
+                theme.show_close_button,
+                draw.rc.left,
+                draw.rc.top,
+                draw.rc.right,
+                draw.rc.bottom,
+                draw.rc.right - draw.rc.left,
+                draw.rc.bottom - draw.rc.top
+            ));
+        }
 
         if draw.dwDrawStage == CDDS_PREPAINT {
             unsafe {
@@ -1367,6 +1405,99 @@ impl TabManager {
         }
 
         Some(CDRF_SKIPDEFAULT)
+    }
+
+    /// Pinta manualmente o TabControl reutilizando processar_custom_draw com
+    /// NMCUSTOMDRAW sintetizados. Usado pelo WM_PAINT do próprio controle porque
+    /// no Excel o NM_CUSTOMDRAW enviado ao pai é engolido (ver despachar_tab_paint).
+    fn pintar_tab_control(&self, hwnd_tab: HWND, hdc: HDC, _rc_paint: RECT) {
+        let mut hwnd_parent = HWND::default();
+        let mut tab_count = 0i32;
+        let mut selected_idx = -1i32;
+        for (raw, estado) in &self.estados {
+            if let Some(ref tab) = estado.tab_control
+                && tab.hwnd == hwnd_tab
+            {
+                hwnd_parent = HWND(*raw as *mut _);
+                tab_count = tab.get_tab_count();
+                selected_idx = tab.get_selected_tab();
+                break;
+            }
+        }
+        if hwnd_parent.is_invalid() {
+            return;
+        }
+
+        // Rect completo do cliente para o fundo da barra (ps.rcPaint pode vir vazio)
+        let mut rc_bar = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd_tab, &mut rc_bar);
+        }
+
+        // 1. Fundo da barra (equivale a CDDS_PREPAINT)
+        let nmcd_bg = NMCUSTOMDRAW {
+            hdr: NMHDR {
+                hwndFrom: hwnd_tab,
+                idFrom: OFFICETAB_CONTROL_ID as usize,
+                code: NM_CUSTOMDRAW,
+            },
+            dwDrawStage: CDDS_PREPAINT,
+            hdc,
+            rc: rc_bar,
+            dwItemSpec: 0,
+            uItemState: NMCUSTOMDRAW_DRAW_STATE_FLAGS(0),
+            lItemlParam: LPARAM(0),
+        };
+        let _ = self.processar_custom_draw(hwnd_parent, &nmcd_bg);
+
+        // 2. Itens (equivale a CDDS_ITEMPREPAINT)
+        let mut pt_cursor = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt_cursor).is_ok() {
+                let _ = ScreenToClient(hwnd_tab, &mut pt_cursor);
+            }
+        }
+
+        for i in 0..tab_count {
+            let mut item_rc = RECT::default();
+            unsafe {
+                let _ = SendMessageW(
+                    hwnd_tab,
+                    crate::tab_control::TCM_GETITEMRECT,
+                    WPARAM(i as usize),
+                    LPARAM(&mut item_rc as *mut _ as isize),
+                );
+            }
+
+            let selected = selected_idx == i;
+            let hot = pt_cursor.x >= item_rc.left
+                && pt_cursor.x < item_rc.right
+                && pt_cursor.y >= item_rc.top
+                && pt_cursor.y < item_rc.bottom;
+
+            let mut state = 0u32;
+            if selected {
+                state |= CDIS_SELECTED.0;
+            }
+            if hot {
+                state |= CDIS_HOT.0;
+            }
+
+            let nmcd = NMCUSTOMDRAW {
+                hdr: NMHDR {
+                    hwndFrom: hwnd_tab,
+                    idFrom: OFFICETAB_CONTROL_ID as usize,
+                    code: NM_CUSTOMDRAW,
+                },
+                dwDrawStage: CDDS_ITEMPREPAINT,
+                hdc,
+                rc: item_rc,
+                dwItemSpec: i as usize,
+                uItemState: NMCUSTOMDRAW_DRAW_STATE_FLAGS(state),
+                lItemlParam: LPARAM(0),
+            };
+            let _ = self.processar_custom_draw(hwnd_parent, &nmcd);
+        }
     }
 
     /// Processa requisições de Tooltip para abas exibindo o caminho completo do arquivo.
@@ -2318,6 +2449,21 @@ pub fn despachar_notify(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
         None
     }))
     .unwrap_or(None)
+}
+
+/// Chamado pelo WM_PAINT do próprio TabControl (SysTabControl32).
+/// No Excel (SDI), o WM_NOTIFY/NM_CUSTOMDRAW que o controle envia ao pai (XLMAIN)
+/// é engolido pelo Excel antes da nossa subclasse vê-lo, então o desenho
+/// customizado (×, título à esquerda, cores) nunca rodava. Aqui pintamos
+/// manualmente reaproveitando processar_custom_draw com um NMCUSTOMDRAW sintetizado.
+pub fn despachar_tab_paint(hwnd_tab: HWND, hdc: HDC, rc_paint: RECT) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut guard) = GLOBAL_TAB_MANAGER.try_lock()
+            && let Some(ref mut manager) = *guard
+        {
+            manager.pintar_tab_control(hwnd_tab, hdc, rc_paint);
+        }
+    }));
 }
 
 /// Chamado via WM_DESTROY/WM_NCDESTROY. Blindado com catch_unwind.
