@@ -2,6 +2,9 @@
 
 We welcome all contributors with open arms! Whether you are an experienced Rust systems engineer, a Win32 / COM enthusiast, a UI designer, or someone who loves testing and reporting edge cases, your help is essential.
 
+## 🚨 Precisamos da sua ajuda agora!
+Versão 0.2.2 estável, mas precisamos de testes em Office 2013, melhorias em temas e internacionalização. Reporte bugs e envie PRs!
+
 ---
 
 ## 📚 Essential Documentation
