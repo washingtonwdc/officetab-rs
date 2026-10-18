@@ -167,11 +167,12 @@ impl TabControl {
             // Aplicar espaçamento horizontal e vertical para um visual arejado e moderno (estilo Fluent)
             // Padding vertical 12: itens de aba mais altos e confortáveis (o desenho
             // customizado usa o rect do item, então altura maior = abas maiores)
+            // Padding horizontal 30: abas largas com folga para o botão '×' de fechar
             let _ = SendMessageW(
                 hwnd,
                 TCM_SETPADDING,
                 WPARAM(0),
-                LPARAM(((12isize) << 16) | 12isize),
+                LPARAM(((12isize) << 16) | 30isize),
             );
 
             // Ativar subclassing no SysTabControl32 para capturar cliques de botão do meio e direito

@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, ScreenToClient, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD, FillRect, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -1237,7 +1238,7 @@ impl TabManager {
 
                 let show_close = theme.show_close_button;
                 let text_right = if show_close {
-                    rc.right - 24
+                    rc.right - 34
                 } else {
                     rc.right - 8
                 };
@@ -1273,8 +1274,8 @@ impl TabManager {
                 // Botão de fechar elegante ("×") — SEMPRE visível em todas as abas
                 // de documento (selecionadas, com hover ou não), como no Office Tab comercial
                 if show_close {
-                    let close_size = 14;
-                    let close_x = rc.right - close_size - 6;
+                    let close_size = 20;
+                    let close_x = rc.right - close_size - 8;
                     let close_y = rc.top + (rc.bottom - rc.top - close_size) / 2;
                     let mut close_rc = RECT {
                         left: close_x,
@@ -1326,12 +1327,41 @@ impl TabManager {
                     }
 
                     let mut x_glyph: [u16; 1] = [0x00D7]; // '×' (U+00D7)
+
+                    // Fonte maior e em negrito para o '×' ficar bem visível e clicável
+                    let hfont_x = CreateFontW(
+                        -20, // altura em pixels (negativo = altura de célula)
+                        0,
+                        0,
+                        0,
+                        FW_BOLD.0 as i32,
+                        0,
+                        0,
+                        0,
+                        DEFAULT_CHARSET.0 as u32,
+                        OUT_DEFAULT_PRECIS.0 as u32,
+                        CLIP_DEFAULT_PRECIS.0 as u32,
+                        CLEARTYPE_QUALITY.0 as u32,
+                        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                        w!("Segoe UI"),
+                    );
+                    let old_font_x = if !hfont_x.is_invalid() {
+                        SelectObject(draw.hdc, hfont_x)
+                    } else {
+                        HGDIOBJ::default()
+                    };
+
                     let _ = DrawTextW(
                         draw.hdc,
                         &mut x_glyph,
                         &mut close_rc,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                     );
+
+                    if !hfont_x.is_invalid() {
+                        let _ = SelectObject(draw.hdc, old_font_x);
+                        let _ = DeleteObject(hfont_x);
+                    }
                 }
             }
         }
@@ -1581,8 +1611,8 @@ impl TabManager {
                         );
                     }
 
-                    let close_size = 14;
-                    let close_x = rc_tab.right - close_size - 6;
+                    let close_size = 20;
+                    let close_x = rc_tab.right - close_size - 8;
                     let close_y = rc_tab.top + (rc_tab.bottom - rc_tab.top - close_size) / 2;
 
                     if x >= close_x - 4
