@@ -45,7 +45,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, FindWindowExW, GWL_STYLE, GetClassNameW,
-    GetClientRect, GetCursorPos, GetDlgItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetClientRect, GetCursorPos, GetDlgItem, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     KillTimer, MF_SEPARATOR, MF_STRING, MoveWindow, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE,
     SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
@@ -1708,25 +1708,38 @@ impl TabManager {
         self.ordem_documentos.retain(|&h| h != hwnd);
 
         // MODO DE JANELA ÚNICA:
-        // Se a janela destruída era a janela visível ativa, restaurar e exibir
-        // imediatamente a próxima janela restante da lista para que o Word
-        // permaneça visível na tela e na barra de tarefas!
+        // Somente restaurar/exibir a próxima janela se a janela DESTRUÍDA era a
+        // janela EM PRIMEIRO PLANO (ativa). Fechar uma aba de FUNDO não deve
+        // roubar o foco — apenas a aba em questão é desativada.
+        let era_ativa = unsafe { GetForegroundWindow() == hwnd };
+
         let proxima_janela = self
             .ordem_documentos
             .first()
             .copied()
             .or_else(|| self.estados.keys().next().map(|&raw| HWND(raw as *mut _)));
 
-        if let Some(hwnd_restante) = proxima_janela {
-            unsafe {
-                if IsWindow(hwnd_restante).as_bool() {
-                    let _ = ShowWindow(hwnd_restante, SW_SHOW);
-                    let _ = BringWindowToTop(hwnd_restante);
-                    let _ = SetForegroundWindow(hwnd_restante);
-                    let _ =
-                        PostMessageW(hwnd_restante, WM_OFFICETAB_RECARREGAR, WPARAM(0), LPARAM(0));
+        if era_ativa {
+            if let Some(hwnd_restante) = proxima_janela {
+                unsafe {
+                    if IsWindow(hwnd_restante).as_bool() {
+                        let _ = ShowWindow(hwnd_restante, SW_SHOW);
+                        let _ = BringWindowToTop(hwnd_restante);
+                        let _ = SetForegroundWindow(hwnd_restante);
+                        let _ = PostMessageW(
+                            hwnd_restante,
+                            WM_OFFICETAB_RECARREGAR,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
             }
+        } else {
+            log_debug(&format!(
+                "processar_destroy: HWND 0x{:X} não estava em primeiro plano; foco preservado",
+                hwnd.0 as usize
+            ));
         }
 
         // Notificar as demais janelas restantes para atualizar as abas imediatamente
@@ -1801,22 +1814,13 @@ impl TabManager {
                         && y <= close_y + close_size + 4
                     {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
-                        let doc_origem = estado.hwnd;
                         log_debug(&format!(
                             "tratar_lbutton_up: fechando doc via clique no botão '×' da aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        if doc_fechar != doc_origem {
-                            // Alternância diferida antes de fechar (evita crash no Excel)
-                            unsafe {
-                                let _ = PostMessageW(
-                                    doc_fechar,
-                                    WM_OFFICETAB_ALTERNAR,
-                                    WPARAM(doc_origem.0 as usize),
-                                    LPARAM(0),
-                                );
-                            }
-                        }
+                        // Fecha APENAS o documento da aba clicada. NÃO alternamos o foco
+                        // para o documento antes de fechar: a aba em questão é desativada
+                        // e o documento ativo permanece em primeiro plano.
                         // WM_CLOSE dispara a caixa de diálogo "Salvar?" nativa do Office
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1840,21 +1844,11 @@ impl TabManager {
                     let total_docs = estado.doc_hwnds.len();
                     if tab_idx >= 0 && (tab_idx as usize) < total_docs {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
-                        let doc_origem = estado.hwnd;
                         log_debug(&format!(
                             "tratar_mbutton_up: fechando doc na aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        if doc_fechar != doc_origem {
-                            unsafe {
-                                let _ = PostMessageW(
-                                    doc_fechar,
-                                    WM_OFFICETAB_ALTERNAR,
-                                    WPARAM(doc_origem.0 as usize),
-                                    LPARAM(0),
-                                );
-                            }
-                        }
+                        // Fecha APENAS o documento da aba clicada, sem alternar foco
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -1877,21 +1871,11 @@ impl TabManager {
                 if let Some(tab_idx) = tab.hit_test(x, y) {
                     if tab_idx >= 0 && (tab_idx as usize) < total_docs {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
-                        let doc_origem = estado.hwnd;
                         log_debug(&format!(
                             "tratar_lbutton_dblclk: fechando doc via clique duplo na aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        if doc_fechar != doc_origem {
-                            unsafe {
-                                let _ = PostMessageW(
-                                    doc_fechar,
-                                    WM_OFFICETAB_ALTERNAR,
-                                    WPARAM(doc_origem.0 as usize),
-                                    LPARAM(0),
-                                );
-                            }
-                        }
+                        // Fecha APENAS o documento da aba clicada, sem alternar foco
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
