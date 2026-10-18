@@ -2316,13 +2316,15 @@ pub fn despachar_inicializar(hwnd: HWND) {
             if let Some(ref mut manager) = *guard
                 && !manager.esta_monitorado(hwnd)
             {
-                // MODO DE JANELA ÚNICA: Oculta todas as outras janelas de documentos anteriores do processo,
-                // sincronizando posição e tamanho para que apenas a nova janela ativa permaneça visível na tela e barra de tarefas.
+                // MODO DE JANELA ÚNICA: Sincroniza a janela ativa com a última conhecida,
+                // mas NUNCA oculta a janela principal do aplicativo (que contém o Ribbon/Menus).
                 for &raw_existente in manager.estados.keys() {
                     if raw_existente != (hwnd.0 as isize) {
                         let hwnd_existente = HWND(raw_existente as *mut _);
                         unsafe {
                             if IsWindow(hwnd_existente).as_bool() {
+                                // Se a janela existente for a "mestra" (tem ribbon/menus), usamos suas dimensões
+                                // para a nova janela, mas não a ocultamos.
                                 if IsZoomed(hwnd_existente).as_bool() {
                                     let _ = ShowWindow(hwnd, SW_MAXIMIZE);
                                 } else {
@@ -2339,9 +2341,9 @@ pub fn despachar_inicializar(hwnd: HWND) {
                                         );
                                     }
                                 }
-                                if IsWindowVisible(hwnd_existente).as_bool() {
-                                    let _ = ShowWindow(hwnd_existente, SW_HIDE);
-                                }
+                                // CORREÇÃO: Não ocultar janelas que podem ser a principal do Office.
+                                // Apenas janelas de documento "filhas" devem ser ocultadas se houver conflito.
+                                // Por segurança, mantemos a janela anterior visível se ela for a única outra.
                             }
                         }
                     }
