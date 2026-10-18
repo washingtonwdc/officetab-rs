@@ -746,12 +746,46 @@ impl TabManager {
             // top-level que CONTÉM a própria Ribbon/menus; ocultá-la faz a interface
             // inteira sumir da tela ("menus somem"). Mantemos todas as janelas visíveis
             // e apenas trazemos o documento de destino para frente/ativo.
+
+            // Garante reposicionamento imediato da área do documento na janela alvo
+            // (evita linha 1 coberta após troca de aba no Excel SDI).
+            self.ajustar_area_documento_apos_alternancia(hwnd_alvo);
         }
 
         log_debug(&format!(
             "Alternado foco de HWND=0x{:X} para HWND=0x{:X} (Modo Janela Única)",
             hwnd_origem.0 as usize, hwnd_alvo.0 as usize
         ));
+    }
+
+    /// Ajusta a área do documento (XLDESK/EXCEL7) imediatamente após alternância de aba,
+    /// garantindo que a linha 1 não fique coberta pela barra de abas no Excel SDI.
+    pub fn ajustar_area_documento_apos_alternancia(&self, hwnd: HWND) {
+        unsafe {
+            if let Some(estado) = self.estados.get(&(hwnd.0 as isize)) {
+                let mut rc_client = windows::Win32::Foundation::RECT::default();
+                if windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc_client).is_ok() {
+                    let largura_cliente = rc_client.right - rc_client.left;
+                    let altura_cliente = rc_client.bottom - rc_client.top;
+                    if largura_cliente <= 100 || altura_cliente <= 100 {
+                        return;
+                    }
+                    let altura_barra = crate::tab_manager::ALTURA_BARRA_ABAS as i32;
+                    let y_ribbon = estado.ult_y_ribbon;
+                    let y_doc = y_ribbon + altura_barra;
+                    if let Some(dv) = estado.hwnd_doc_view {
+                        if windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(dv).as_bool() {
+                            let h_status = crate::tab_manager::calcular_altura_status_bar(hwnd, altura_cliente);
+                            let h_doc = (altura_cliente - y_doc - h_status).max(10);
+                            if y_doc >= 0 && h_doc > 0 && largura_cliente > 0 && altura_cliente > 0 {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                                crate::tab_manager::log_debug(&format!("ajustar_area_documento_apos_alternancia: MoveWindow XLDESK 0x{:X} y={} h={}", dv.0 as usize, y_doc, h_doc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Sincroniza o controle visual de abas e redimensionamento.
