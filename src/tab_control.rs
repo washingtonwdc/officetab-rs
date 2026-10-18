@@ -33,8 +33,9 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DestroyWindow, GetClientRect, HMENU, HWND_TOP, MoveWindow,
-    SW_SHOW, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos,
+    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -446,10 +447,21 @@ fn procedimento_tab_control_subclass_interno(
             }
             // Agora delega ao DefSubclassProc para que o Windows processe o WM_PAINT
             // nativo do SysTabControl32 e não quebre o owner-draw / foco / realce do controle.
-            // Apenas validamos a região para não entrarmos em loop.
+            // Após o processamento padrão, traz o controle para o topo para garantir
+            // que o botão “×” e o conteúdo da aba não fiquem sobrepostos.
+            let _ = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
             unsafe {
-                let _ = DefSubclassProc(hwnd, msg, wparam, lparam);
-                let _ = ValidateRect(hwnd, None);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                let _ = InvalidateRect(hwnd, None, true);
+                let _ = UpdateWindow(hwnd);
             }
             return LRESULT(0);
         }
