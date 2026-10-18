@@ -442,7 +442,6 @@ fn procedimento_tab_control_subclass_interno(
                 crate::tab_manager::despachar_tab_paint(hwnd, hdc, rc);
                 unsafe {
                     let _ = ReleaseDC(hwnd, hdc);
-                    // Não validamos ainda: deixe o BeginPaint normal fazer o resto.
                 }
             }
             // Agora delega ao DefSubclassProc para que o Windows processe o WM_PAINT
@@ -460,8 +459,7 @@ fn procedimento_tab_control_subclass_interno(
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
-                let _ = InvalidateRect(hwnd, None, true);
-                let _ = UpdateWindow(hwnd);
+                // NÃO invalida aqui — isso causava loop de pintura (piscar)
             }
             return LRESULT(0);
         }
