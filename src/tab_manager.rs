@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, OUT_DEFAULT_PRECIS, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT, InvalidateRect, UpdateWindow,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_NOTIFYITEMDRAW,
@@ -1732,6 +1732,25 @@ impl TabManager {
                             WPARAM(0),
                             LPARAM(0),
                         );
+                    }
+                }
+            } else {
+                // Última janela destruída: encerrar o Excel/Word de forma nativa.
+                // Não há mais janelas XLMAIN registradas. Pedimos ao Office para fechar o app.
+                // Estratégia segura: enviar WM_CLOSE para a janela pai (próxima janela)
+                // ou terminar o processo do Excel se não houver janelas restantes.
+                unsafe {
+                    let mut pid = 0u32;
+                    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                    if pid != 0 {
+                        crate::tab_manager::log_debug(&format!(
+                            "processar_destroy: última janela destruída, encerrando processo {}",
+                            pid
+                        ));
+                        let hproc = OpenProcess(PROCESS_TERMINATE, false, pid);
+                        if let Ok(hproc) = hproc {
+                            let _ = TerminateProcess(hproc, 0);
+                        }
                     }
                 }
             }
