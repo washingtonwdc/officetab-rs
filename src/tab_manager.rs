@@ -913,23 +913,31 @@ impl TabManager {
                     // Forçar invalidação da barra logo após trazer ao topo
                     let _ = InvalidateRect(tab.hwnd, None, true);
                     let _ = UpdateWindow(tab.hwnd);
+                    // Garantir que a barra fique acima do documento
+                    if let Some(dv) = estado.hwnd_doc_view {
+                        let _ = SetWindowPos(dv, tab.hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
                 }
             }
 
             // Deslocar área do documento para baixo da barra de abas apenas quando o layout mudar
             if let Some(dv) = estado.hwnd_doc_view
-                && IsWindowVisible(dv).as_bool()
             {
                 let y_doc = y_ribbon + altura_barra;
-                let dx_doc = estado.ult_x_doc != largura_cliente || y_doc != estado.ult_y_doc || layout_mudou;
-                if layout_mudou || dx_doc {
-                    let h_status = calcular_altura_status_bar(hwnd, altura_cliente);
-                    let h_doc = (altura_cliente - y_doc - h_status).max(10);
-                    if y_doc >= 0 && h_doc > 0 && largura_cliente > 0 && altura_cliente > 0 {
-                        let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                let layout_mudou_ou_dimensao = layout_mudou
+                    || y_doc != estado.ult_y_doc
+                    || largura_cliente != estado.ult_x_doc;
+                if layout_mudou_ou_dimensao || estado.hwnd_doc_view.is_some() {
+                    let visivel = unsafe { IsWindowVisible(dv).as_bool() };
+                    if visivel {
+                        let h_status = calcular_altura_status_bar(hwnd, altura_cliente);
+                        let h_doc = (altura_cliente - y_doc - h_status).max(10);
+                        if y_doc >= 0 && h_doc > 0 && largura_cliente > 0 && altura_cliente > 0 {
+                            let _ = MoveWindow(dv, 0, y_doc, largura_cliente, h_doc, true);
+                        }
+                        estado.ult_y_doc = y_doc;
+                        estado.ult_x_doc = largura_cliente;
                     }
-                    estado.ult_y_doc = y_doc;
-                    estado.ult_x_doc = largura_cliente;
                 }
             }
 
