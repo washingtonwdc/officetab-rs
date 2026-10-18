@@ -173,6 +173,8 @@ pub fn obter_tipo_app(classe: &str) -> TipoAppOffice {
         "PP10FrameClass",
         "PP11FrameClass",
         "PP12FrameClass",
+        "PPTSlideShowFrameClass",
+        "PowerPoint Slide Show",
     ]
     .iter()
     .any(|c| classe.eq_ignore_ascii_case(c))
@@ -352,6 +354,34 @@ pub fn calcular_altura_status_bar(hwnd_top: HWND, altura_cliente: i32) -> i32 {
     }
 }
 
+/// Procura recursivamente janelas FullpageUIHost ou Screen em toda a hierarquia.
+pub fn encontrar_fullpage_ou_screen(hwnd_root: HWND) -> Option<HWND> {
+    unsafe {
+        let mut stack = vec![hwnd_root];
+        while let Some(h) = stack.pop() {
+            let mut child = HWND::default();
+            loop {
+                child = match FindWindowExW(h, child, PCWSTR::null(), PCWSTR::null()) {
+                    Ok(c) if !c.is_invalid() => c,
+                    _ => break,
+                };
+                let mut buf = [0u16; 64];
+                let cn = GetClassNameW(child, &mut buf);
+                if cn > 0 {
+                    let cls = String::from_utf16_lossy(&buf[..cn as usize]);
+                    if cls.eq_ignore_ascii_case("FullpageUIHost") || cls.eq_ignore_ascii_case("screen 1") || cls.eq_ignore_ascii_case("screen2") || cls.eq_ignore_ascii_case("paneClassDC") {
+                        if IsWindowVisible(child).as_bool() {
+                            return Some(child);
+                        }
+                    }
+                }
+                stack.push(child);
+            }
+        }
+        None
+    }
+}
+
 /// Detecta se a janela do Office está na tela inicial ou no modo Backstage (Menu Arquivo / Novo / Abrir).
 pub fn backstage_esta_aberto(hwnd_top: HWND) -> bool {
     unsafe {
@@ -392,6 +422,54 @@ pub fn backstage_esta_aberto(hwnd_top: HWND) -> bool {
     }
 }
 
+/// Detecta se PowerPoint está em modo de apresentação (Slide Show).
+/// No modo de apresentação o PowerPoint usa uma janela filha `Screen 1`/`paneClassDC` que ocupa
+/// praticamente toda a área cliente, ou a classe da janela top muda para `PPTSlideShowFrameClass`.
+pub fn powerpoint_em_apresentacao(hwnd_top: HWND, app_tipo: TipoAppOffice) -> bool {
+    unsafe {
+        if app_tipo != TipoAppOffice::PowerPoint {
+            return false;
+        }
+
+        // 1) Classe da janela top com nome contendo "SlideShow" é apresentação
+        let mut nome = [0u16; 64];
+        let n = GetClassNameW(hwnd_top, &mut nome);
+        if n > 0 {
+            let nome_str = String::from_utf16_lossy(&nome[..n as usize]);
+            if nome_str.to_lowercase().contains("slideshow") {
+                return true;
+            }
+        }
+
+        // 1b) Título da janela contém "Apresentação de Slides" / "Slide Show"
+        let titulo = extrair_texto_janela(hwnd_top);
+        let titulo_lower = titulo.to_lowercase();
+        if titulo_lower.contains("apresentação de slides")
+            || titulo_lower.contains("slide show")
+            || titulo_lower.contains("modo de exibição")
+        {
+            return true;
+        }
+
+        // 1c) Busca recursiva por janela Screen 1/paneClassDC que ocupe quase toda a área
+        if let Some(host) = encontrar_fullpage_ou_screen(hwnd_top) {
+            let mut rc_client = RECT::default();
+            let mut rc_host = RECT::default();
+            if GetClientRect(hwnd_top, &mut rc_client).is_ok() && GetWindowRect(host, &mut rc_host).is_ok() {
+                let w_client = rc_client.right - rc_client.left;
+                let h_client = rc_client.bottom - rc_client.top;
+                let w_host = rc_host.right - rc_host.left;
+                let h_host = rc_host.bottom - rc_host.top;
+                if w_client > 100 && h_client > 100 && w_host > w_client * 9 / 10 && h_host > h_client * 9 / 10 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
 /// Estado interno e visual associado a cada janela principal de documento do Office
 pub struct EstadoJanela {
     pub hwnd: HWND,
@@ -400,6 +478,7 @@ pub struct EstadoJanela {
     pub y_base: i32,
     pub doc_hwnds: Vec<HWND>,
     pub titulos_cache: Vec<String>,
+    pub ordem_documentos: Vec<HWND>,
     pub ult_largura: i32,
     pub ult_altura: i32,
     pub ult_y_ribbon: i32,
@@ -613,7 +692,6 @@ pub struct TabManager {
     subclass_manager: SubclassManager,
     estados: HashMap<isize, EstadoJanela>,
     pub config: OfficeTabConfig,
-    ordem_documentos: Vec<HWND>,
 }
 
 unsafe impl Send for TabManager {}
@@ -626,7 +704,6 @@ impl TabManager {
             subclass_manager: SubclassManager::new(),
             estados: HashMap::new(),
             config,
-            ordem_documentos: Vec::new(),
         }
     }
 
@@ -683,6 +760,7 @@ impl TabManager {
                 y_base: 0,
                 doc_hwnds: Vec::new(),
                 titulos_cache: Vec::new(),
+                ordem_documentos: Vec::new(),
                 ult_largura: 0,
                 ult_altura: 0,
                 ult_y_ribbon: 0,
@@ -861,6 +939,31 @@ impl TabManager {
                 return Ok(());
             }
 
+            // Esconder abas no PowerPoint em modo de apresentação (Slide Show)
+            if powerpoint_em_apresentacao(hwnd, app_tipo) {
+                if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
+                    && let Some(ref tab) = estado.tab_control
+                {
+                    let _ = ShowWindow(tab.hwnd, SW_HIDE);
+                }
+                log_debug(&format!("sincronizar_janela: PowerPoint em apresentação - abas ocultas HWND 0x{:X}", hwnd.0 as usize));
+                return Ok(());
+            }
+
+            // Excel: esconder abas quando FullpageUIHost / Screen cobre a janela (modo de apresentação/Visualização)
+            if app_tipo == TipoAppOffice::Excel {
+                if let Some(host) = encontrar_fullpage_ou_screen(hwnd) {
+                    // Esconder imediatamente sem checar tamanho para garantir que não apareça
+                    if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
+                        && let Some(ref tab) = estado.tab_control
+                    {
+                        let _ = ShowWindow(tab.hwnd, SW_HIDE);
+                    }
+                    log_debug(&format!("sincronizar_janela: Excel FullpageUIHost/Screen detectado - abas ocultas HWND 0x{:X}", hwnd.0 as usize));
+                    return Ok(());
+                }
+            }
+
             // Documento em edição ativo: garantir que o controle de abas esteja visível
             if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
                 && let Some(ref tab) = estado.tab_control
@@ -935,21 +1038,24 @@ impl TabManager {
             // a cada sincronização, senão a barra fica invisível.
             if let Some(ref tab) = estado.tab_control {
                 unsafe {
-                    let _ = SetWindowPos(
-                        tab.hwnd,
-                        HWND_TOP,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                    // Forçar invalidação da barra logo após trazer ao topo
-                    let _ = InvalidateRect(tab.hwnd, None, true);
-                    let _ = UpdateWindow(tab.hwnd);
-                    // Garantir que a barra fique acima do documento
-                    if let Some(dv) = estado.hwnd_doc_view {
-                        let _ = SetWindowPos(dv, tab.hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    // Se o TabControl estiver oculto (apresentação/Fullpage), não o traga ao topo nem invalide
+                    if IsWindowVisible(tab.hwnd).as_bool() {
+                        let _ = SetWindowPos(
+                            tab.hwnd,
+                            HWND_TOP,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        // Forçar invalidação da barra logo após trazer ao topo
+                        let _ = InvalidateRect(tab.hwnd, None, true);
+                        let _ = UpdateWindow(tab.hwnd);
+                        // Garantir que a barra fique acima do documento
+                        if let Some(dv) = estado.hwnd_doc_view {
+                            let _ = SetWindowPos(dv, tab.hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
                     }
                 }
             }
@@ -990,49 +1096,22 @@ impl TabManager {
                 docs_processo.push((hwnd, tit_limpo));
             }
 
-            // Preserva rigorosamente a posição estável das abas (não altera a ordem ao alternar foco):
-            let hwnds_atuais: Vec<HWND> = docs_processo.iter().map(|(h, _)| *h).collect();
-            self.ordem_documentos.retain(|h| hwnds_atuais.contains(h));
-
-            for &h in &hwnds_atuais {
-                if !self.ordem_documentos.contains(&h) {
-                    self.ordem_documentos.push(h);
-                }
-            }
-
-            let mut docs_estaveis: Vec<(HWND, String)> = Vec::new();
-            for &h in &self.ordem_documentos {
-                if let Some((_, tit)) = docs_processo.iter().find(|(dh, _)| *dh == h) {
-                    docs_estaveis.push((h, tit.clone()));
-                }
-            }
-
-            let novos_titulos: Vec<String> = docs_estaveis.iter().map(|(_, t)| t.clone()).collect();
-            let novos_hwnds: Vec<HWND> = docs_estaveis.iter().map(|(h, _)| *h).collect();
+            // Modo instância independente: cada janela mostra apenas a si mesma
+            estado.ordem_documentos.clear();
+            estado.ordem_documentos.push(hwnd);
+            estado.doc_hwnds.clear();
+            estado.doc_hwnds.push(hwnd);
+            let tit = limpar_titulo_documento(&extrair_texto_janela(hwnd));
+            estado.titulos_cache.clear();
+            estado.titulos_cache.push(tit.clone());
 
             if let Some(ref tab) = estado.tab_control {
-                if novos_titulos != estado.titulos_cache || novos_hwnds != estado.doc_hwnds {
-                    tab.clear_tabs();
-
-                    for (idx, (doc_hwnd, doc_titulo)) in docs_estaveis.iter().enumerate() {
-                        let _ = tab.add_tab(idx as i32, doc_titulo);
-                        if *doc_hwnd == hwnd {
-                            let _ = tab.set_selected_tab(idx as i32);
-                        }
-                    }
-
-                    // Aba "+" para novo documento
-                    let _ = tab.add_tab(docs_estaveis.len() as i32, "+");
-
-                    estado.doc_hwnds = novos_hwnds;
-                    estado.titulos_cache = novos_titulos;
-                    tab.repaint();
-                } else if let Some(pos) = estado.doc_hwnds.iter().position(|&h| h == hwnd)
-                    && tab.get_selected_tab() != pos as i32
-                {
-                    let _ = tab.set_selected_tab(pos as i32);
-                    tab.repaint();
-                }
+                tab.clear_tabs();
+                let _ = tab.add_tab(0, &tit);
+                let _ = tab.set_selected_tab(0);
+                // Aba "+" para novo documento
+                let _ = tab.add_tab(1, "+");
+                tab.repaint();
             }
 
             Ok(())
@@ -1146,10 +1225,16 @@ impl TabManager {
 
         if draw.dwDrawStage == CDDS_PREPAINT {
             unsafe {
-                // Preenche o fundo da barra de abas
-                let brush = CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(
-                    theme.bar_background,
-                )));
+                // Preenche o fundo da barra de abas usando cor idêntica ao menu original.
+                // No Excel, usar branco puro do ribbon para eliminar qualquer tom rosa.
+                let classe_top = extrair_classe_janela(hwnd);
+                let app_tipo = obter_tipo_app(&classe_top);
+                let bar_cr = if app_tipo == TipoAppOffice::Excel {
+                    COLORREF(0x00FFFFFF) // branco puro do ribbon Excel
+                } else {
+                    COLORREF(crate::theme::Theme::to_colorref(theme.bar_background))
+                };
+                let brush = CreateSolidBrush(bar_cr);
                 let _ = FillRect(draw.hdc, &draw.rc, brush);
                 let _ = DeleteObject(brush);
 
@@ -1481,6 +1566,14 @@ impl TabManager {
         let mut rc_bar = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd_tab, &mut rc_bar);
+            // Garante fundo branco puro no Excel antes de qualquer desenho
+            let classe_top = extrair_classe_janela(hwnd_parent);
+            let app_tipo = obter_tipo_app(&classe_top);
+            if app_tipo == TipoAppOffice::Excel {
+                let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
+                let _ = FillRect(hdc, &rc_bar, brush);
+                let _ = DeleteObject(brush);
+            }
         }
 
         // 1. Fundo da barra (equivale a CDDS_PREPAINT)
@@ -1640,11 +1733,12 @@ impl TabManager {
                 theme.custom_accent_color = Some(0x00185ABD); // Accent bar azul Word
             }
             TipoAppOffice::Excel => {
-                theme.active_tab_bg = 0x00EBF5EF; // Verde sálvia suave pastel
+                theme.active_tab_bg = 0x00FFFFFF; // Fundo branco igual ao menu original
                 theme.active_tab_text = 0x000F5132; // Verde Excel floresta
-                theme.hover_tab_bg = 0x00F0FAF3; // Hover verde sutil
-                theme.tab_border = 0x00C4DFCE; // Borda verde sálvia
+                theme.hover_tab_bg = 0x00FFFFFF; // Hover branco
+                theme.tab_border = 0x00D0D0D0; // Borda neutra
                 theme.custom_accent_color = Some(0x00107C41); // Accent bar verde esmeralda
+                theme.bar_background = 0x00FFFFFF; // Barra branca como menu original
             }
             TipoAppOffice::PowerPoint => {
                 theme.active_tab_bg = 0x00FDF0EC; // Pêssego/carmim suave pastel
@@ -1698,85 +1792,18 @@ impl TabManager {
         unsafe {
             let _ = KillTimer(hwnd, OFFICETAB_TIMER_ID);
         }
-        if let Some(mut estado) = self.estados.remove(&(hwnd.0 as isize))
-            && let Some(ref mut tab) = estado.tab_control
-        {
-            tab.destroy();
-        }
-
-        // Remover da lista ordenada de documentos
-        self.ordem_documentos.retain(|&h| h != hwnd);
-
-        // MODO DE JANELA ÚNICA:
-        // Somente restaurar/exibir a próxima janela se a janela DESTRUÍDA era a
-        // janela EM PRIMEIRO PLANO (ativa). Fechar uma aba de FUNDO não deve
-        // roubar o foco — apenas a aba em questão é desativada.
-        let era_ativa = unsafe { GetForegroundWindow() == hwnd };
-
-        let proxima_janela = self
-            .ordem_documentos
-            .first()
-            .copied()
-            .or_else(|| self.estados.keys().next().map(|&raw| HWND(raw as *mut _)));
-
-        if era_ativa {
-            if let Some(hwnd_restante) = proxima_janela {
-                unsafe {
-                    if IsWindow(hwnd_restante).as_bool() {
-                        let _ = ShowWindow(hwnd_restante, SW_SHOW);
-                        let _ = BringWindowToTop(hwnd_restante);
-                        let _ = SetForegroundWindow(hwnd_restante);
-                        let _ = PostMessageW(
-                            hwnd_restante,
-                            WM_OFFICETAB_RECARREGAR,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
-            } else {
-                // Última janela destruída: encerrar o Excel/Word de forma nativa.
-                // Não há mais janelas XLMAIN registradas. Pedimos ao Office para fechar o app.
-                // Estratégia segura: enviar WM_CLOSE para a janela pai (próxima janela)
-                // ou terminar o processo do Excel se não houver janelas restantes.
-                unsafe {
-                    let mut pid = 0u32;
-                    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                    if pid != 0 {
-                        crate::tab_manager::log_debug(&format!(
-                            "processar_destroy: última janela destruída, encerrando processo {}",
-                            pid
-                        ));
-                        let hproc = OpenProcess(PROCESS_TERMINATE, false, pid);
-                        if let Ok(hproc) = hproc {
-                            let _ = TerminateProcess(hproc, 0);
-                        }
-                    }
-                }
-            }
-        } else {
-            log_debug(&format!(
-                "processar_destroy: HWND 0x{:X} não estava em primeiro plano; foco preservado",
-                hwnd.0 as usize
-            ));
-        }
-
-        // Notificar as demais janelas restantes para atualizar as abas imediatamente
-        for &raw_restante in self.estados.keys() {
-            let hwnd_restante = HWND(raw_restante as *mut _);
-            if Some(hwnd_restante) != proxima_janela {
-                unsafe {
-                    if IsWindow(hwnd_restante).as_bool() {
-                        let _ = PostMessageW(
-                            hwnd_restante,
-                            WM_OFFICETAB_RECARREGAR,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
+        // Modo instância independente: remover apenas o estado da janela destruída
+        // Cada janela XLMAIN/OpusApp é independente
+        if let Some(estado) = self.estados.remove(&(hwnd.0 as isize)) {
+            if let Some(mut tab) = estado.tab_control {
+                tab.destroy();
             }
         }
+
+        log_debug(&format!(
+            "processar_destroy: HWND 0x{:X} removido do gerenciamento",
+            hwnd.0 as usize
+        ));
     }
 
     /// Limpa todos os hooks e referências ativas.
@@ -1791,7 +1818,6 @@ impl TabManager {
             }
         }
         self.estados.clear();
-        self.ordem_documentos.clear();
         self.subclass_manager.unsubclass_all();
     }
 
@@ -1834,13 +1860,11 @@ impl TabManager {
                     {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
                         log_debug(&format!(
-                            "tratar_lbutton_up: fechando doc via clique no botão '×' da aba {} HWND=0x{:X}",
+                            "tratar_lbutton_up: fechando documento da aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        // Fecha APENAS o documento da aba clicada. NÃO alternamos o foco
-                        // para o documento antes de fechar: a aba em questão é desativada
-                        // e o documento ativo permanece em primeiro plano.
-                        // WM_CLOSE dispara a caixa de diálogo "Salvar?" nativa do Office
+                        // Modo instância independente: fechar apenas a janela do documento,
+                        // não a janela principal da barra
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -1864,10 +1888,9 @@ impl TabManager {
                     if tab_idx >= 0 && (tab_idx as usize) < total_docs {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
                         log_debug(&format!(
-                            "tratar_mbutton_up: fechando doc na aba {} HWND=0x{:X}",
+                            "tratar_mbutton_up: fechando documento da aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        // Fecha APENAS o documento da aba clicada, sem alternar foco
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -1879,7 +1902,7 @@ impl TabManager {
     }
 
     /// Trata o clique duplo do mouse (Double Click) sobre o controle de abas.
-    /// Clique duplo na aba fecha o documento.
+    /// Clique duplo na aba remove a aba da barra (instância independente).
     /// Clique duplo na barra vazia ou no botão '+' cria novo documento.
     pub fn tratar_lbutton_dblclk(&mut self, hwnd_tab: HWND, x: i32, y: i32) {
         for estado in self.estados.values_mut() {
@@ -1891,10 +1914,9 @@ impl TabManager {
                     if tab_idx >= 0 && (tab_idx as usize) < total_docs {
                         let doc_fechar = estado.doc_hwnds[tab_idx as usize];
                         log_debug(&format!(
-                            "tratar_lbutton_dblclk: fechando doc via clique duplo na aba {} HWND=0x{:X}",
+                            "tratar_lbutton_dblclk: fechando documento da aba {} HWND=0x{:X}",
                             tab_idx, doc_fechar.0 as usize
                         ));
-                        // Fecha APENAS o documento da aba clicada, sem alternar foco
                         unsafe {
                             let _ = PostMessageW(doc_fechar, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -2789,6 +2811,9 @@ fn criar_novo_documento(hwnd: HWND) {
     // 1. Tentar criar via COM IDispatch (método oficial e confiável em qualquer idioma do Office)
     if crate::com_addin_simple::criar_documento_com() {
         log_debug("Documento criado nativamente via COM IDispatch com sucesso");
+        // Aguardar a nova janela e registrar como independente
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // O WinEventHook vai capturar a nova janela e criar novo Estado independente
         return;
     }
 

@@ -17,7 +17,7 @@
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET,
-    DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, HDC,
+    DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL,
     GetDC, GetStockObject, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, ReleaseDC,
     UpdateWindow, ValidateRect,
 };
@@ -33,7 +33,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DestroyWindow, GetClientRect, HMENU, HWND_TOP, MoveWindow,
-    SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos,
+    SW_SHOW, SWP_SHOWWINDOW, SendMessageW, SetWindowPos,
     ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_VISIBLE,
 };
@@ -427,12 +427,18 @@ fn procedimento_tab_control_subclass_interno(
         // o desenho customizado (×, título à esquerda, cores) nunca roda via pai.
         // Pintamos manualmente reaproveitando o desenho do TabManager.
         //
-        // IMPORTANTE: usamos GetDC (e não BeginPaint) porque o DC do BeginPaint é
+        // IMPORTANTE 1: usamos GetDC (e não BeginPaint) porque o DC do BeginPaint é
         // recortado pela update region, que chegou vazia (ps.rcPaint=(0,0,0,0)) no
-        // Excel — todo o desenho era descartado. GetDC cobre o cliente inteiro;
-        // validamos a região depois com ValidateRect para parar o WM_PAINT.
+        // Excel — todo o desenho era descartado.
+        //
+        // IMPORTANTE 2: NÃO chamamos DefSubclassProc aqui. A pintura nativa do
+        // SysTabControl32 executada depois da nossa APAGAVA o desenho customizado
+        // (×, cores, título) — só sobrevivia o que caía nos vãos entre as abas,
+        // fazendo o × "aparecer apenas na fronteira entre abas".
+        //
+        // IMPORTANTE 3: NÃO chamamos InvalidateRect aqui — isso criava um loop de
+        // pintura e fazia as abas piscarem.
         WM_PAINT => {
-            // Primeiro, pinta toda a barra via GetDC (evita update region vazia do Excel).
             let hdc = unsafe { GetDC(hwnd) };
             if !hdc.is_invalid() {
                 let mut rc = RECT::default();
@@ -440,26 +446,12 @@ fn procedimento_tab_control_subclass_interno(
                     let _ = GetClientRect(hwnd, &mut rc);
                 }
                 crate::tab_manager::despachar_tab_paint(hwnd, hdc, rc);
-                unsafe {
-                    let _ = ReleaseDC(hwnd, hdc);
-                }
+                unsafe { let _ = ReleaseDC(hwnd, hdc); }
             }
-            // Agora delega ao DefSubclassProc para que o Windows processe o WM_PAINT
-            // nativo do SysTabControl32 e não quebre o owner-draw / foco / realce do controle.
-            // Após o processamento padrão, traz o controle para o topo para garantir
-            // que o botão “×” e o conteúdo da aba não fiquem sobrepostos.
-            let _ = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            // Valida a região de atualização para encerrar o ciclo de pintura
+            // (não há pintura nativa — o desenho é 100% nosso).
             unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-                // NÃO invalida aqui — isso causava loop de pintura (piscar)
+                let _ = ValidateRect(hwnd, None);
             }
             return LRESULT(0);
         }
