@@ -1081,11 +1081,14 @@ impl TabManager {
                 }
             }
 
-            // Popular abas com documentos abertos
-            // As janelas não ativas do Word ficam ocultas no modo de abas,
-            // mas continuam sendo documentos abertos e precisam permanecer
-            // representadas na barra.
+            // Popular abas com documentos abertos - apenas documentos do mesmo processo/instância
             let mut docs_processo = listar_janelas_processo();
+            // Filtrar apenas janelas do mesmo processo (instância independente por processo)
+            let pid_atual = unsafe { GetCurrentProcessId() };
+            docs_processo.retain(|(hwnd_doc, _)| {
+                let pid_doc = unsafe { GetWindowThreadProcessId(*hwnd_doc, Some(std::ptr::null_mut())) };
+                pid_doc == pid_atual
+            });
             if docs_processo.is_empty() {
                 let tit = extrair_texto_janela(hwnd);
                 let tit_limpo = if tit.is_empty() {
@@ -1096,22 +1099,58 @@ impl TabManager {
                 docs_processo.push((hwnd, tit_limpo));
             }
 
-            // Modo instância independente: cada janela mostra apenas a si mesma
-            estado.ordem_documentos.clear();
-            estado.ordem_documentos.push(hwnd);
-            estado.doc_hwnds.clear();
-            estado.doc_hwnds.push(hwnd);
-            let tit = limpar_titulo_documento(&extrair_texto_janela(hwnd));
-            estado.titulos_cache.clear();
-            estado.titulos_cache.push(tit.clone());
+            // Filtrar apenas documentos do tipo correto (mesmo app)
+            let classe_atual = extrair_classe_janela(hwnd);
+            let tipo_app_atual = obter_tipo_app(&classe_atual);
+            docs_processo.retain(|(hwnd_doc, _)| {
+                let classe_doc = extrair_classe_janela(*hwnd_doc);
+                let tipo_app_doc = obter_tipo_app(&classe_doc);
+                tipo_app_doc == tipo_app_atual
+            });
+
+            // Preserva rigorosamente a posição estável das abas (não altera a ordem ao alternar foco):
+            let hwnds_atuais: Vec<HWND> = docs_processo.iter().map(|(h, _)| *h).collect();
+            estado.ordem_documentos.retain(|h| hwnds_atuais.contains(h));
+
+            for &h in &hwnds_atuais {
+                if !estado.ordem_documentos.contains(&h) {
+                    estado.ordem_documentos.push(h);
+                }
+            }
+
+            let mut docs_estaveis: Vec<(HWND, String)> = Vec::new();
+            for &h in &estado.ordem_documentos {
+                if let Some((_, tit)) = docs_processo.iter().find(|(dh, _)| *dh == h) {
+                    docs_estaveis.push((h, tit.clone()));
+                }
+            }
+
+            let novos_titulos: Vec<String> = docs_estaveis.iter().map(|(_, t)| t.clone()).collect();
+            let novos_hwnds: Vec<HWND> = docs_estaveis.iter().map(|(h, _)| *h).collect();
 
             if let Some(ref tab) = estado.tab_control {
-                tab.clear_tabs();
-                let _ = tab.add_tab(0, &tit);
-                let _ = tab.set_selected_tab(0);
-                // Aba "+" para novo documento
-                let _ = tab.add_tab(1, "+");
-                tab.repaint();
+                if novos_titulos != estado.titulos_cache || novos_hwnds != estado.doc_hwnds {
+                    tab.clear_tabs();
+
+                    for (idx, (doc_hwnd, doc_título)) in docs_estaveis.iter().enumerate() {
+                        let _ = tab.add_tab(idx as i32, doc_título);
+                        if *doc_hwnd == hwnd {
+                            let _ = tab.set_selected_tab(idx as i32);
+                        }
+                    }
+
+                    // Aba "+" para novo documento
+                    let _ = tab.add_tab(docs_estaveis.len() as i32, "+");
+
+                    estado.doc_hwnds = novos_hwnds;
+                    estado.titulos_cache = novos_titulos;
+                    tab.repaint();
+                } else if let Some(pos) = estado.doc_hwnds.iter().position(|&h| h == hwnd)
+                    && tab.get_selected_tab() != pos as i32
+                {
+                    let _ = tab.set_selected_tab(pos as i32);
+                    tab.repaint();
+                }
             }
 
             Ok(())
@@ -1182,16 +1221,11 @@ impl TabManager {
             }
             return Some(LRESULT(0));
         } else if (sel as usize) == total_docs {
-            // Clicou na aba "+"
+            // Clicou na aba "+": criar nova aba na mesma instância
             unsafe {
                 let _ = PostMessageW(hwnd, WM_OFFICETAB_NOVO_DOC, WPARAM(0), LPARAM(0));
             }
-            if let Some(estado) = self.estados.get(&(hwnd.0 as isize))
-                && let Some(ref tab) = estado.tab_control
-                && let Some(pos) = doc_hwnds.iter().position(|&h| h == hwnd)
-            {
-                let _ = tab.set_selected_tab(pos as i32);
-            }
+            // Não re-seleciona - a nova aba será criada e sincronizada pelo WM_OFFICETAB_NOVO_DOC
             return Some(LRESULT(0));
         }
         None
