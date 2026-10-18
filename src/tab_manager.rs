@@ -735,11 +735,11 @@ impl TabManager {
             // forjado com lParam=0 desreferenciava handle nulo nos internos MDI do
             // Excel e derrubava o processo ao alternar abas (Access Violation).
 
-            // MODO DE JANELA ÚNICA: Ocultar a janela anterior para que apenas
-            // uma única instância/janela do Word/Excel permaneça visível na tela e na barra de tarefas.
-            if hwnd_origem != hwnd_alvo && IsWindow(hwnd_origem).as_bool() {
-                let _ = ShowWindow(hwnd_origem, SW_HIDE);
-            }
+            // IMPORTANTE (Excel 2013+ SDI / Word MDI): NÃO ocultamos a janela de origem
+            // com SW_HIDE. No Excel SDI cada pasta de trabalho é uma janela XLMAIN
+            // top-level que CONTÉM a própria Ribbon/menus; ocultá-la faz a interface
+            // inteira sumir da tela ("menus somem"). Mantemos todas as janelas visíveis
+            // e apenas trazemos o documento de destino para frente/ativo.
         }
 
         log_debug(&format!(
