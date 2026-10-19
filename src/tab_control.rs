@@ -18,7 +18,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET,
     DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL,
-    GetDC, GetStockObject, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, ReleaseDC,
+    GetDC, GetStockObject, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, ReleaseDC,
     UpdateWindow, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::{
@@ -78,6 +78,18 @@ pub struct TCHITTESTINFO {
 pub struct TabControl {
     pub hwnd: HWND,
     font: Option<HFONT>,
+}
+
+impl TabControl {
+    /// Retorna o HGDIOBJ da fonte ativa para uso na pintura customizada.
+    pub fn obter_hfont_gdi(&self) -> HGDIOBJ {
+        if let Some(f) = self.font
+            && !f.is_invalid()
+        {
+            return HGDIOBJ(f.0);
+        }
+        unsafe { GetStockObject(DEFAULT_GUI_FONT) }
+    }
 }
 
 /// Obtém o HINSTANCE do módulo que contém a função `obter_hinstance_dll`.
@@ -166,15 +178,14 @@ impl TabControl {
                 let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
             }
 
-            // Aplicar espaçamento horizontal e vertical para um visual arejado e moderno (estilo Fluent)
-            // Padding vertical 12: itens de aba mais altos e confortáveis (o desenho
-            // customizado usa o rect do item, então altura maior = abas maiores)
-            // Padding horizontal 30: abas largas com folga para o botão '×' de fechar
+            // Espaçamento escalonado por DPI para manter proporção do botão '×' em monitores 4K
+            let pad_x = calcular_altura_por_dpi(hwnd, 30) as isize;
+            let pad_y = calcular_altura_por_dpi(hwnd, 12) as isize;
             let _ = SendMessageW(
                 hwnd,
                 TCM_SETPADDING,
                 WPARAM(0),
-                LPARAM(((12isize) << 16) | 30isize),
+                LPARAM((pad_y << 16) | (pad_x & 0xFFFF)),
             );
 
             // Ativar subclassing no SysTabControl32 para capturar cliques de botão do meio e direito

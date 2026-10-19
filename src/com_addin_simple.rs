@@ -50,7 +50,13 @@ pub fn salvar_application_dispatch(raw_ptr: *mut c_void) {
         let cloned = (*unk).clone();
         let raw = cloned.into_raw();
         if let Ok(mut guard) = OFFICE_APP_DISPATCH.lock() {
-            *guard = Some(raw as usize);
+            // Libera referência anterior caso OnConnection seja chamado novamente
+            if let Some(old_ptr) = guard.replace(raw as usize) {
+                let _ = IUnknown::from_raw(old_ptr as *mut c_void);
+            }
+        } else {
+            let _ = IUnknown::from_raw(raw);
+            return;
         }
         crate::tab_manager::log_debug(&format!(
             "salvar_application_dispatch: salvo com sucesso ptr=0x{:X}",
