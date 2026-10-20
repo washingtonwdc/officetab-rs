@@ -354,6 +354,31 @@ pub fn calcular_altura_status_bar(hwnd_top: HWND, altura_cliente: i32) -> i32 {
     }
 }
 
+/// Contexto para o callback de enumeração de _WwG.
+struct EnumWwgCtx<'a> {
+    encontrado: &'a mut bool,
+}
+
+/// Callback para EnumChildWindows: procura qualquer _WwG visível.
+unsafe extern "system" fn enum_wwg_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = lparam.0 as *mut EnumWwgCtx;
+    if ctx.is_null() {
+        return BOOL(1); // continua enumeração
+    }
+    let mut buf = [0u16; 64];
+    let cn = GetClassNameW(hwnd, &mut buf);
+    if cn > 0 {
+        let cls = String::from_utf16_lossy(&buf[..cn as usize]);
+        if cls.eq_ignore_ascii_case("_WwG") {
+            if IsWindowVisible(hwnd).as_bool() {
+                *(*ctx).encontrado = true;
+                return BOOL(0); // para enumeração — achou um visível
+            }
+        }
+    }
+    BOOL(1) // continua enumeração
+}
+
 /// Procura recursivamente janelas FullpageUIHost ou Screen em toda a hierarquia.
 pub fn encontrar_fullpage_ou_screen(hwnd_root: HWND) -> Option<HWND> {
     unsafe {
@@ -970,6 +995,37 @@ impl TabManager {
                         let _ = ShowWindow(tab.hwnd, SW_HIDE);
                     }
                     log_debug(&format!("sincronizar_janela: Excel FullpageUIHost/Screen detectado - abas ocultas HWND 0x{:X}", hwnd.0 as usize));
+                    return Ok(());
+                }
+            }
+
+            // Word: esconder abas na tela de abertura (Start Screen).
+            // Na tela inicial do Word a _WwF permanece visível (engana o fallback de
+            // localizar_area_documento), mas a _WwG (área de edição do documento) NÃO
+            // está visível — é o estado exato de "nenhum documento aberto".
+            // Usamos EnumChildWindows (igual ao teste) para achar QUALQUER _WwG visível,
+            // pois FindWindowExW só retorna a primeira na Z-order.
+            if app_tipo == TipoAppOffice::Word {
+                let mut wwg_encontrado = false;
+                unsafe {
+                    let hwnd_parent = hwnd;
+                    let mut cb = Some(enum_wwg_callback as unsafe extern "system" fn(HWND, LPARAM) -> BOOL);
+                    let mut ctx = EnumWwgCtx {
+                        encontrado: &mut wwg_encontrado,
+                    };
+                    EnumChildWindows(hwnd_parent, cb, LPARAM(&mut ctx as *mut _ as isize));
+                }
+                let documento_visivel = wwg_encontrado;
+                if !documento_visivel {
+                    if let Some(estado) = self.estados.get_mut(&(hwnd.0 as isize))
+                        && let Some(ref tab) = estado.tab_control
+                    {
+                        let _ = ShowWindow(tab.hwnd, SW_HIDE);
+                    }
+                    log_debug(&format!(
+                        "sincronizar_janela: Word tela de abertura (_WwG invisível) - abas ocultas HWND 0x{:X}",
+                        hwnd.0 as usize
+                    ));
                     return Ok(());
                 }
             }
