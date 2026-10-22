@@ -1311,15 +1311,8 @@ impl TabManager {
 
         if draw.dwDrawStage == CDDS_PREPAINT {
             unsafe {
-                // Preenche o fundo da barra de abas usando cor idêntica ao menu original.
-                // No Excel, usar branco puro do ribbon para eliminar qualquer tom rosa.
-                let classe_top = extrair_classe_janela(hwnd);
-                let app_tipo = obter_tipo_app(&classe_top);
-                let bar_cr = if app_tipo == TipoAppOffice::Excel {
-                    COLORREF(0x00FFFFFF) // branco puro do ribbon Excel
-                } else {
-                    COLORREF(crate::theme::Theme::to_colorref(theme.bar_background))
-                };
+                // Preenche o fundo da barra de abas usando a paleta ativa do tema.
+                let bar_cr = COLORREF(crate::theme::Theme::to_colorref(theme.bar_background));
                 let brush = CreateSolidBrush(bar_cr);
                 let _ = FillRect(draw.hdc, &draw.rc, brush);
                 let _ = DeleteObject(brush);
@@ -1656,14 +1649,11 @@ impl TabManager {
         let mut rc_bar = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd_tab, &mut rc_bar);
-            // Garante fundo branco puro no Excel antes de qualquer desenho
-            let classe_top = extrair_classe_janela(hwnd_parent);
-            let app_tipo = obter_tipo_app(&classe_top);
-            if app_tipo == TipoAppOffice::Excel {
-                let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
-                let _ = FillRect(hdc, &rc_bar, brush);
-                let _ = DeleteObject(brush);
-            }
+            let theme = self.tema_da_janela(hwnd_parent);
+            let brush =
+                CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(theme.bar_background)));
+            let _ = FillRect(hdc, &rc_bar, brush);
+            let _ = DeleteObject(brush);
         }
 
         // 1. Fundo da barra (equivale a CDDS_PREPAINT)
@@ -1821,11 +1811,11 @@ impl TabManager {
                 }
                 TipoAppOffice::Excel => {
                     theme.active_tab_bg = 0x00FFFFFF;
-                    theme.active_tab_text = 0x000F5132;
-                    theme.hover_tab_bg = 0x00F3F9F5;
-                    theme.tab_border = 0x00D0D0D0;
+                    theme.active_tab_text = 0x00107C41;
+                    theme.hover_tab_bg = 0x00E8F5E9;
+                    theme.tab_border = 0x00A5D6A7;
                     theme.custom_accent_color = Some(0x00107C41);
-                    theme.bar_background = 0x00FFFFFF;
+                    theme.bar_background = 0x00107C41;
                 }
                 TipoAppOffice::PowerPoint => {
                     theme.active_tab_bg = 0x00FDF0EC;
@@ -2156,9 +2146,15 @@ impl TabManager {
         } else if vk == b'W' as usize || vk == 0x73
         /* VK_F4 */
         {
-            // Ctrl+W ou Ctrl+F4: fechar documento atual
+            // Ctrl+W ou Ctrl+F4: fechar documento da aba atualmente selecionada.
+            // Se a seleção estiver inconsistente, cai no HWND ativo como fallback.
+            let alvo_fechamento = if cur >= 0 && (cur as usize) < total {
+                doc_hwnds[cur as usize]
+            } else {
+                hwnd
+            };
             unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(alvo_fechamento, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
             return true;
         } else if vk == b'T' as usize {
