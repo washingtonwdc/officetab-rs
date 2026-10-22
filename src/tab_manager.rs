@@ -711,6 +711,10 @@ pub const IDM_COPIAR_CAMINHO: usize = 3004;
 pub const IDM_ABRIR_PASTA: usize = 3005;
 pub const IDM_NOVA_ABA: usize = 3006;
 pub const IDM_FECHAR_TODAS: usize = 3007;
+pub const IDM_COR_VERDE: usize = 3008;
+pub const IDM_COR_AZUL: usize = 3009;
+pub const IDM_COR_ROXA: usize = 3010;
+pub const IDM_COR_VERMELHA: usize = 3011;
 
 /// Dados capturados antes de abrir o menu de contexto (fora do lock de `GLOBAL_TAB_MANAGER`).
 /// Permite construir e exibir o menu SEM segurar o lock global, evitando deadlock com
@@ -1311,15 +1315,8 @@ impl TabManager {
 
         if draw.dwDrawStage == CDDS_PREPAINT {
             unsafe {
-                // Preenche o fundo da barra de abas usando cor idêntica ao menu original.
-                // No Excel, usar branco puro do ribbon para eliminar qualquer tom rosa.
-                let classe_top = extrair_classe_janela(hwnd);
-                let app_tipo = obter_tipo_app(&classe_top);
-                let bar_cr = if app_tipo == TipoAppOffice::Excel {
-                    COLORREF(0x00FFFFFF) // branco puro do ribbon Excel
-                } else {
-                    COLORREF(crate::theme::Theme::to_colorref(theme.bar_background))
-                };
+                // Preenche o fundo da barra de abas usando a paleta ativa do tema.
+                let bar_cr = COLORREF(crate::theme::Theme::to_colorref(theme.bar_background));
                 let brush = CreateSolidBrush(bar_cr);
                 let _ = FillRect(draw.hdc, &draw.rc, brush);
                 let _ = DeleteObject(brush);
@@ -1656,14 +1653,11 @@ impl TabManager {
         let mut rc_bar = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd_tab, &mut rc_bar);
-            // Garante fundo branco puro no Excel antes de qualquer desenho
-            let classe_top = extrair_classe_janela(hwnd_parent);
-            let app_tipo = obter_tipo_app(&classe_top);
-            if app_tipo == TipoAppOffice::Excel {
-                let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
-                let _ = FillRect(hdc, &rc_bar, brush);
-                let _ = DeleteObject(brush);
-            }
+            let theme = self.tema_da_janela(hwnd_parent);
+            let brush =
+                CreateSolidBrush(COLORREF(crate::theme::Theme::to_colorref(theme.bar_background)));
+            let _ = FillRect(hdc, &rc_bar, brush);
+            let _ = DeleteObject(brush);
         }
 
         // 1. Fundo da barra (equivale a CDDS_PREPAINT)
@@ -1821,11 +1815,11 @@ impl TabManager {
                 }
                 TipoAppOffice::Excel => {
                     theme.active_tab_bg = 0x00FFFFFF;
-                    theme.active_tab_text = 0x000F5132;
-                    theme.hover_tab_bg = 0x00F3F9F5;
-                    theme.tab_border = 0x00D0D0D0;
+                    theme.active_tab_text = 0x00107C41;
+                    theme.hover_tab_bg = 0x00E8F5E9;
+                    theme.tab_border = 0x00A5D6A7;
                     theme.custom_accent_color = Some(0x00107C41);
-                    theme.bar_background = 0x00FFFFFF;
+                    theme.bar_background = 0x00107C41;
                 }
                 TipoAppOffice::PowerPoint => {
                     theme.active_tab_bg = 0x00FDF0EC;
@@ -1873,6 +1867,52 @@ impl TabManager {
         }
 
         theme
+    }
+
+    fn aplicar_cor_abas_personalizada(&mut self, cor_base: u32) {
+        fn canal(cor: u32, shift: u32) -> u8 {
+            ((cor >> shift) & 0xFF) as u8
+        }
+        fn rgb(r: u8, g: u8, b: u8) -> u32 {
+            ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        }
+        fn clarear(cor: u32, valor: u8) -> u32 {
+            let r = canal(cor, 16).saturating_add(valor);
+            let g = canal(cor, 8).saturating_add(valor);
+            let b = canal(cor, 0).saturating_add(valor);
+            rgb(r, g, b)
+        }
+        fn escurecer(cor: u32, valor: u8) -> u32 {
+            let r = canal(cor, 16).saturating_sub(valor);
+            let g = canal(cor, 8).saturating_sub(valor);
+            let b = canal(cor, 0).saturating_sub(valor);
+            rgb(r, g, b)
+        }
+
+        self.config.general.adaptive_theme_by_app = false;
+        self.config.theme.name = "Custom Color".to_string();
+        self.config.theme.active_tab_bg = cor_base;
+        self.config.theme.inactive_tab_bg = clarear(cor_base, 26);
+        self.config.theme.hover_tab_bg = clarear(cor_base, 14);
+        self.config.theme.bar_background = escurecer(cor_base, 18);
+        self.config.theme.tab_border = clarear(cor_base, 40);
+        self.config.theme.active_tab_text = 0x00FFFFFF;
+        self.config.theme.inactive_tab_text = 0x00FFFFFF;
+        self.config.theme.hover_tab_text = 0x00FFFFFF;
+        self.config.theme.custom_accent_color = Some(cor_base);
+
+        if let Err(error) = crate::persistence::save_effective_config(&self.config) {
+            log_debug(&format!(
+                "Falha ao salvar cor personalizada das abas: {:?}",
+                error
+            ));
+        }
+
+        for estado in self.estados.values() {
+            if let Some(ref tab) = estado.tab_control {
+                tab.repaint();
+            }
+        }
     }
 
     /// Trata a destruição de uma janela no Modo de Janela Única.
@@ -2156,9 +2196,15 @@ impl TabManager {
         } else if vk == b'W' as usize || vk == 0x73
         /* VK_F4 */
         {
-            // Ctrl+W ou Ctrl+F4: fechar documento atual
+            // Ctrl+W ou Ctrl+F4: fechar documento da aba atualmente selecionada.
+            // Se a seleção estiver inconsistente, cai no HWND ativo como fallback.
+            let alvo_fechamento = if cur >= 0 && (cur as usize) < total {
+                doc_hwnds[cur as usize]
+            } else {
+                hwnd
+            };
             unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(alvo_fechamento, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
             return true;
         } else if vk == b'T' as usize {
@@ -2300,6 +2346,31 @@ fn exibir_menu_contexto_sem_lock(hwnd_tab: HWND, pt_screen: POINT, info: Context
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_ABRIR_PASTA, w!("&Abrir Pasta do Arquivo"));
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_NOVA_ABA, w!("&Nova Aba\tCtrl+N"));
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_VERDE,
+                w!("Cor da Aba: &Verde (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_AZUL,
+                w!("Cor da Aba: A&zul (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_ROXA,
+                w!("Cor da Aba: &Roxa (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_VERMELHA,
+                w!("Cor da Aba: &Vermelha (fonte branca)"),
+            );
         } else {
             // Clicou na área vazia da barra ou na aba "+"
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_NOVA_ABA, w!("&Nova Aba\tCtrl+N"));
@@ -2307,6 +2378,31 @@ fn exibir_menu_contexto_sem_lock(hwnd_tab: HWND, pt_screen: POINT, info: Context
                 let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
                 let _ = AppendMenuW(hmenu, MF_STRING, IDM_FECHAR_TODAS, w!("Fechar &Todas as Abas"));
             }
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_VERDE,
+                w!("Cor da Aba: &Verde (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_AZUL,
+                w!("Cor da Aba: A&zul (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_ROXA,
+                w!("Cor da Aba: &Roxa (fonte branca)"),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_COR_VERMELHA,
+                w!("Cor da Aba: &Vermelha (fonte branca)"),
+            );
         }
 
         let cmd = TrackPopupMenu(
@@ -2407,7 +2503,19 @@ fn exibir_menu_contexto_sem_lock(hwnd_tab: HWND, pt_screen: POINT, info: Context
                 }
             }
         }
+        IDM_COR_VERDE => aplicar_cor_abas_personalizada_global(0x00107C41),
+        IDM_COR_AZUL => aplicar_cor_abas_personalizada_global(0x002B579A),
+        IDM_COR_ROXA => aplicar_cor_abas_personalizada_global(0x007719AA),
+        IDM_COR_VERMELHA => aplicar_cor_abas_personalizada_global(0x00A4373A),
         _ => {}
+    }
+}
+
+fn aplicar_cor_abas_personalizada_global(cor_base: u32) {
+    if let Ok(mut guard) = GLOBAL_TAB_MANAGER.lock()
+        && let Some(ref mut manager) = *guard
+    {
+        manager.aplicar_cor_abas_personalizada(cor_base);
     }
 }
 
@@ -3238,6 +3346,10 @@ mod testes {
             IDM_ABRIR_PASTA,
             IDM_NOVA_ABA,
             IDM_FECHAR_TODAS,
+            IDM_COR_VERDE,
+            IDM_COR_AZUL,
+            IDM_COR_ROXA,
+            IDM_COR_VERMELHA,
         ];
         let mut set = std::collections::HashSet::new();
         for &id in &ids {
